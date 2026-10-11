@@ -12,8 +12,11 @@
 Папка будет создана автоматически, если её нет.</p>
 <form method="post" action="/admin">
 <input class="dir" type="text" name="directory" placeholder="/var/data/files" value="{{current}}">
+<p class="sub" style="margin-top:14px">Пароль администратора (смена): <span style="color:#6b7280">{{pwd_hint}}</span></p>
+<input class="dir" type="password" name="new_password" placeholder="Новый пароль (не обязательно)" autocomplete="new-password">
 <button type="submit">Сохранить</button>
 <button class="secondary" type="submit" name="clear" value="1">Сбросить настройку</button>
 </form>
+<p class="sub" style="margin-top:14px"><a href="/logout">Выйти из админ-сессии</a></p>
 </div>
 </div></body></html>

@@ -20,6 +20,8 @@ pub fn load_template(name: &str) -> &'static str {
         "not_configured.html" => include_str!("../static/not_configured.html"),
         "main_page.html" => include_str!("../static/main_page.html"),
         "admin.html" => include_str!("../static/admin.html"),
+        "login.html" => include_str!("../static/login.html"),
+        "denied.html" => include_str!("../static/denied.html"),
         _ => panic!("unknown template: {name}"),
     }
 }
