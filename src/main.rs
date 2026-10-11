@@ -2,15 +2,19 @@ use std::path::PathBuf;
 
 use axum::extract::{Multipart, Path as AxPath, State};
 use axum::http::{header, StatusCode};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use serde::Deserialize;
 use tokio::fs;
 
+mod auth;
+mod config;
 mod state;
 mod templates;
 
+use auth::AdminCookie;
 use state::{AppState, Templates};
 
 const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100 MB per file
@@ -18,26 +22,64 @@ const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100 MB per file
 #[tokio::main]
 async fn main() {
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-    // Optional: preconfigure storage via env var (otherwise server starts "unconfigured")
-    let initial_storage = std::env::var("STORAGE_DIR").ok().map(PathBuf::from);
-    if let Some(dir) = &initial_storage {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("Не удалось создать директорию {dir:?}: {e}");
-            std::process::exit(1);
+
+    // Конфиг лежит в «домашней директории приложения» (Windows/Linux/Mac — свои пути),
+    // формат TOML по умолчанию; переопределяется переменной FILE_SERVER_CONFIG.
+    let config_path = config::config_path();
+    let mut cfg = match config::Config::load(&config_path) {
+        Ok(Some(c)) => c,
+        Ok(None) => config::Config::with_storage(None),
+        Err(e) => {
+            eprintln!("Предупреждение: {e} — начинаем с чистого конфига");
+            config::Config::with_storage(None)
+        }
+    };
+
+    // Первый запуск: пароль администратора можно задать переменной окружения,
+    // иначе он будет создан автоматически на странице /admin.
+    if !cfg.has_admin_password() {
+        if let Ok(pwd) = std::env::var("ADMIN_PASSWORD") {
+            cfg.admin.password_hash = auth::hash_password(&pwd);
+            if let Err(e) = cfg.save(&config_path) {
+                eprintln!("Не удалось сохранить конфиг: {e}");
+            }
         }
     }
 
-    // HTML pages live in static/*.html — load them once at startup.
+    // Переменная STORAGE_DIR остаётся как способ предзадать директорию (например, в Docker).
+    if let Some(dir) = std::env::var("STORAGE_DIR").ok().map(PathBuf::from) {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Не удалось создать директорию {dir:?}: {e}");
+            std::process::exit(1);
+        }
+        if cfg.storage_dir.as_ref() != Some(&dir) {
+            cfg.storage_dir = Some(dir);
+            if let Err(e) = cfg.save(&config_path) {
+                eprintln!("Не удалось сохранить конфиг: {e}");
+            }
+        }
+    }
+
     let templates = Templates::load();
-    let state = AppState::new(templates);
-    state.set_storage_dir(initial_storage);
+    let state = AppState::new(templates, config_path.clone(), cfg.clone());
+
+    // Админ-зона (/admin, /logout) закрыта middleware require_admin:
+    // пользователи без сессии видят страницу «нет доступа».
+    let admin_zone = Router::new()
+        .route("/admin", get(admin_page).post(admin_submit))
+        .route("/logout", get(logout))
+        // Удаление файлов — тоже админская операция: пользователи могут только
+        // загружать и скачивать, но не стирать чужие файлы.
+        .route("/delete/{*name}", axum::routing::post(delete_file))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
     let app = Router::new()
         .route("/", get(index))
         .route("/upload", axum::routing::post(upload))
         .route("/download/{*name}", get(download))
-        .route("/delete/{*name}", axum::routing::post(delete_file))
-        .route("/admin", get(admin_page).post(admin_submit))
+        // Открытая зона входа — только если пароль уже установлен.
+        .route("/login", get(login_page).post(login_submit))
+        .merge(admin_zone)
         // CSS is embedded into the binary too, so the server needs no files at runtime.
         .route("/style.css", get(|| async {
             ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], templates::STYLE_CSS)
@@ -54,6 +96,7 @@ async fn main() {
     println!("Файловый сервер запущен на http://{bind}");
     println!("  Главная:      http://{bind}/");
     println!("  Админ-панель: http://{bind}/admin");
+    println!("  Конфиг:       {}", config_path.display());
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Ошибка сервера: {e}");
@@ -314,6 +357,7 @@ async fn delete_file(State(state): State<AppState>, AxPath(raw): AxPath<String>)
 struct AdminForm {
     directory: Option<String>,
     clear: Option<String>,
+    new_password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -321,35 +365,62 @@ struct AdminQuery {
     msg: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct LoginForm {
+    password: String,
+}
+
 async fn admin_page(State(state): State<AppState>, query: axum::extract::Query<AdminQuery>) -> Response {
     let current = state.storage_dir().map(|d| d.display().to_string());
     let message = match query.msg.as_deref() {
         Some("saved") => Some("Настройка сохранена: обмен файлами работает."),
         Some("cleared") => Some("Настройка сброшена: пользователи снова видят заглушку."),
+        Some("password") => Some("Пароль администратора обновлён."),
         _ => None,
     };
     render_admin(&state, current.as_deref(), message, None)
 }
 
 async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>) -> Response {
+    // Смена пароля — необязательное поле; заполняется только если админ хочет его поменять.
+    let new_password = form.new_password.unwrap_or_default();
+    if !new_password.is_empty() {
+        if new_password.len() < 6 {
+            return render_admin_error(&state, "Пароль должен быть не короче 6 символов.");
+        }
+        if let Err(e) = state.set_admin_password_hash(auth::hash_password(&new_password)) {
+            return render_admin_error(&state, &format!("Не удалось сохранить пароль: {e}"));
+        }
+    }
+
     if form.clear.as_deref() == Some("1") {
-        state.set_storage_dir(None);
+        if let Err(e) = state.set_storage_dir(None) {
+            return render_admin_error(&state, &format!("Не удалось сохранить конфиг: {e}"));
+        }
         return Redirect::to("/admin?msg=cleared").into_response();
     }
 
     let raw = form.directory.unwrap_or_default().trim().to_string();
     if raw.is_empty() {
-        return render_admin_error(&state, "Укажите путь к директории.");
+        return if new_password.is_empty() {
+            render_admin_error(&state, "Укажите путь к директории.")
+        } else {
+            // Пароль сохранён, директория не менялась.
+            Redirect::to("/admin?msg=password").into_response()
+        };
     }
     let path = PathBuf::from(&raw);
     if !path.is_absolute() {
-        return render_admin_error(&state, "Путь должен быть абсолютным (начинаться с «/»).");
+        return render_admin_error(&state, "Путь должен быть абсолютным («/…» или «C:\\…»).");
     }
     if let Err(e) = fs::create_dir_all(&path).await {
         return render_admin_error(&state, &format!("Не удалось создать директорию: {e}"));
     }
-    state.set_storage_dir(Some(path));
-    Redirect::to("/admin?msg=saved").into_response()
+    if let Err(e) = state.set_storage_dir(Some(path)) {
+        return render_admin_error(&state, &format!("Не удалось сохранить конфиг: {e}"));
+    }
+    Redirect::to(if new_password.is_empty() { "/admin?msg=saved" } else { "/admin?msg=password" })
+        .into_response()
 }
 
 fn render_admin_error(state: &AppState, msg: &str) -> Response {
@@ -373,6 +444,11 @@ fn render_admin(
         Some(_) => "<div class=\"ok\">Сервер настроен: обмен файлами работает.</div>",
         None => "<div class=\"banner\">Сервер не настроен: пользователи видят заглушку.</div>",
     };
+    let pwd_hint = if state.config().has_admin_password() {
+        "Оставьте пустым, чтобы не менять текущий пароль."
+    } else {
+        "Пароль ещё не установлен — задайте его прямо сейчас (минимум 6 символов)."
+    };
 
     Html(templates::render(
         &state.templates.admin,
@@ -380,9 +456,89 @@ fn render_admin(
             ("message", &msg),
             ("status", status),
             ("current", &value),
+            ("pwd_hint", &templates::html_escape(pwd_hint)),
         ],
     ))
     .into_response()
+}
+
+/// Страница входа в админку. Если пароль ещё не установлен — форма первичной настройки.
+async fn login_page(State(state): State<AppState>) -> Response {
+    let cfg = state.config();
+    if !cfg.has_admin_password() {
+        // Пароля нет: /admin открыт без входа, ссылка на логин не нужна.
+        return Redirect::to("/admin").into_response();
+    }
+    Html(render_login(&state.templates, "", "Вход в админ-панель",
+        "Админ-панель доступна только создателю сервера. Введите пароль.",
+        "/login", "", "Войти")).into_response()
+}
+
+/// Обработка формы входа: проверяем пароль, заводим cookie-сессию.
+async fn login_submit(
+    State(state): State<AppState>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let cfg = state.config();
+    if !cfg.has_admin_password() {
+        return Redirect::to("/admin").into_response();
+    }
+    if auth::verify_password(&form.password, &cfg.admin.password_hash) {
+        let token = state.create_session();
+        (
+            StatusCode::SEE_OTHER,
+            [(header::SET_COOKIE, auth::session_cookie(&token))],
+            [(header::LOCATION, "/admin")],
+        )
+            .into_response()
+    } else {
+        Html(render_login(
+            &state.templates,
+            "<div class=\"banner\">Неверный пароль.</div>",
+            "Вход в админ-панель",
+            "Админ-панель доступна только создателю сервера. Введите пароль.",
+            "/login",
+            "",
+            "Войти",
+        ))
+        .into_response()
+    }
+}
+
+/// Выход из админ-сессии.
+async fn logout(State(state): State<AppState>, cookie: AdminCookie) -> Response {
+    if let Some(token) = cookie.0 {
+        state.revoke_session(&token);
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [(header::SET_COOKIE, auth::clear_cookie())],
+        [(header::LOCATION, "/")],
+    )
+        .into_response()
+}
+
+/// Рендер `static/login.html` с подстановкой текстов режима (вход / первая настройка).
+fn render_login(
+    templates_: &Templates,
+    message: &str,
+    heading: &str,
+    intro: &str,
+    action: &str,
+    second_field: &str,
+    button: &str,
+) -> String {
+    templates::render(
+        templates_.login,
+        &[
+            ("message", message),
+            ("heading", heading),
+            ("intro", intro),
+            ("action", action),
+            ("second_field", second_field),
+            ("button", button),
+        ],
+    )
 }
 
 /// Percent-decode a path segment (UTF-8 aware).

@@ -1,0 +1,18 @@
+<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Админ-доступ — Файловый сервер</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<nav class="top"><span style="font-weight:700;font-size:18px">&#128274; Админ-доступ</span>
+<a href="/">Открыть главную &rarr;</a></nav>
+<div class="container">
+{{message}}
+<div class="card">
+<h1>{{heading}}</h1>
+<p class="sub">{{intro}}</p>
+<form method="post" action="{{action}}">
+<input class="dir" type="password" name="password" placeholder="Пароль" autocomplete="current-password">
+{{second_field}}
+<button type="submit">{{button}}</button>
+</form>
+</div>
+</div></body></html>
