@@ -1,0 +1,19 @@
+<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Админ-панель — Файловый сервер</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<nav class="top"><span style="font-weight:700;font-size:18px">&#128230; Админ-панель</span>
+<a href="/">Открыть главную &rarr;</a></nav>
+<div class="container">
+{{message}}{{status}}
+<div class="card">
+<h1>Директория для хранения файлов</h1>
+<p class="sub">Укажите путь к папке на сервере, куда будут сохраняться загруженные файлы.
+Папка будет создана автоматически, если её нет.</p>
+<form method="post" action="/admin">
+<input class="dir" type="text" name="directory" placeholder="/var/data/files" value="{{current}}">
+<button type="submit">Сохранить</button>
+<button class="secondary" type="submit" name="clear" value="1">Сбросить настройку</button>
+</form>
+</div>
+</div></body></html>

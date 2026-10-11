@@ -1,0 +1,41 @@
+<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Файловый сервер</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<nav class="top"><span style="font-weight:700;font-size:18px">&#128230; Файловый сервер</span>
+<a href="/admin">Админ-панель &rarr;</a></nav>
+<div class="container">
+{{flash}}
+<div class="card">
+<h1>Загрузить файл</h1>
+<p class="sub">Хранилище: <code>{{dir}}</code></p>
+<div class="dropzone" id="dz">Перетащите файлы сюда или нажмите, чтобы выбрать
+<input type="file" id="fin" multiple></div>
+<progress id="prog" max="100" value="0" style="display:none"></progress>
+</div>
+<div class="card">
+<h1>Доступные файлы</h1>
+<p class="sub">Нажмите «Скачать», чтобы получить файл.</p>
+{{files}}
+</div>
+</div>
+<script>
+const dz=document.getElementById('dz'),fin=document.getElementById('fin'),prog=document.getElementById('prog');
+dz.onclick=()=>fin.click();
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag')});
+dz.addEventListener('dragleave',()=>dz.classList.remove('drag'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag');upload(e.dataTransfer.files)});
+fin.addEventListener('change',()=>upload(fin.files));
+async function upload(files){
+ if(!files.length)return;
+ const fd=new FormData();for(const f of files)fd.append('files',f);
+ prog.style.display='block';prog.value=0;
+ const xhr=new XMLHttpRequest();xhr.open('POST','/upload');
+ xhr.upload.onprogress=e=>{if(e.lengthComputable)prog.value=e.loaded/e.total*100};
+ xhr.onload=()=>location.reload();
+ xhr.onerror=()=>alert('Ошибка загрузки');
+ xhr.send(fd);
+}
+function delFile(url){fetch('/delete/'+url,{method:'POST'}).then(()=>location.reload())}
+</script>
+</body></html>

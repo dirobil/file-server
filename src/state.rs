@@ -1,14 +1,44 @@
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use crate::templates;
+
+/// HTML templates loaded from the `static/` directory at startup.
+#[derive(Clone)]
+pub struct Templates {
+    pub not_configured: std::sync::Arc<String>,
+    pub main_page: std::sync::Arc<String>,
+    pub admin: std::sync::Arc<String>,
+}
+
+impl Templates {
+    /// Read all template files from `static/` once (they are served as plain files,
+    /// so they can be edited without recompiling — just restart the server).
+    pub fn load() -> Self {
+        Self {
+            not_configured: std::sync::Arc::new(templates::load_template("not_configured.html")),
+            main_page: std::sync::Arc::new(templates::load_template("main_page.html")),
+            admin: std::sync::Arc::new(templates::load_template("admin.html")),
+        }
+    }
+}
+
 /// Shared application state: the (optional) storage directory configured by admin.
 /// Cheap to clone because the directory lives behind an `Arc`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppState {
     pub storage: std::sync::Arc<RwLock<Option<PathBuf>>>,
+    pub templates: Templates,
 }
 
 impl AppState {
+    pub fn new(templates: Templates) -> Self {
+        Self {
+            storage: std::sync::Arc::new(RwLock::new(None)),
+            templates,
+        }
+    }
+
     /// Currently configured storage directory, if any.
     pub fn storage_dir(&self) -> Option<PathBuf> {
         self.storage.read().expect("state lock poisoned").clone()
