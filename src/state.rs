@@ -3,22 +3,22 @@ use std::sync::RwLock;
 
 use crate::templates;
 
-/// HTML templates loaded from the `static/` directory at startup.
-#[derive(Clone)]
+/// HTML templates embedded into the binary at compile time (`include_str!`).
+/// `'static` references — no allocation, works from any working directory.
+#[derive(Clone, Copy)]
 pub struct Templates {
-    pub not_configured: std::sync::Arc<String>,
-    pub main_page: std::sync::Arc<String>,
-    pub admin: std::sync::Arc<String>,
+    pub not_configured: &'static str,
+    pub main_page: &'static str,
+    pub admin: &'static str,
 }
 
 impl Templates {
-    /// Read all template files from `static/` once (they are served as plain files,
-    /// so they can be edited without recompiling — just restart the server).
+    /// Return the compiled-in templates.
     pub fn load() -> Self {
         Self {
-            not_configured: std::sync::Arc::new(templates::load_template("not_configured.html")),
-            main_page: std::sync::Arc::new(templates::load_template("main_page.html")),
-            admin: std::sync::Arc::new(templates::load_template("admin.html")),
+            not_configured: templates::load_template("not_configured.html"),
+            main_page: templates::load_template("main_page.html"),
+            admin: templates::load_template("admin.html"),
         }
     }
 }
