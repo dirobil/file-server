@@ -93,6 +93,26 @@ impl AppState {
         cfg.save(&self.config_path)
     }
 
+    /// Включить/выключить шифрование файлов на диске. При первом включении
+    /// генерируется ключ (32 байта от OS CSPRNG) и сохраняется в конфиг.
+    pub fn set_encryption(&self, enabled: bool) -> Result<(), String> {
+        let cfg = {
+            let mut cur = self.config.write().expect("config lock poisoned");
+            cur.version = crate::config::CONFIG_VERSION;
+            cur.encryption.enabled = enabled;
+            if enabled && crate::crypto::key_from_hex(&cur.encryption.key_hex).is_none() {
+                cur.encryption.key_hex = crate::crypto::key_to_hex(&crate::crypto::generate_key());
+            }
+            cur.clone()
+        };
+        cfg.save(&self.config_path)
+    }
+
+    /// Текущий рабочий ключ шифрования (`None` — шифрование выключено).
+    pub fn encryption_key(&self) -> Option<[u8; 32]> {
+        self.config.read().expect("config lock poisoned").encryption_key()
+    }
+
     // ---------- Админ-сессии ----------
 
     /// Создать новый токен сессии (32 байта криптостойкой случайности).

@@ -11,6 +11,7 @@ use tokio::fs;
 
 mod auth;
 mod config;
+mod crypto;
 mod state;
 mod templates;
 
@@ -154,7 +155,21 @@ async fn list_files(dir: &PathBuf) -> Vec<(String, u64)> {
             if let Ok(meta) = entry.metadata().await {
                 if meta.is_file() {
                     if let Some(name) = entry.file_name().to_str() {
-                        out.push((name.to_string(), meta.len()));
+                        // Файлы метаданных (*.meta.json) — служебные, не показываем.
+                        if name.ends_with(".meta.json") {
+                            continue;
+                        }
+                        // Для шифрованных файлов показываем размер оригинала.
+                        let size = match crypto::has_meta(dir, name) {
+                            true => fs::read(crypto::meta_path(dir, name))
+                                .await
+                                .ok()
+                                .and_then(|b| serde_json::from_slice::<crypto::FileMeta>(&b).ok())
+                                .map(|m| m.size)
+                                .unwrap_or_else(|| meta.len()),
+                            false => meta.len(),
+                        };
+                        out.push((name.to_string(), size));
                     }
                 }
             }
@@ -194,7 +209,21 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             .map(|s| s.to_string())
             .unwrap_or_else(|| "file".to_string());
         let name = AppState::sanitize_name(&raw_name);
+        let content_type = field
+            .content_type()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
         let path = unique_path(&dir, &name).await;
+        // Имя, под которым файл реально лежит на диске (может отличаться из-за дубликатов).
+        let stored_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let enc_key = state.encryption_key();
+
+        // Случайная «база» nonce для потока шифрования (уникальна на каждый файл).
+        let mut nonce_base = [0u8; 8];
+        use rand::TryRngCore;
+        let _ = rand::rngs::OsRng.try_fill_bytes(&mut nonce_base);
+        let mut seq: u32 = 0;
+        let mut plain_size: u64 = 0;
 
         // stream the field to disk in chunks to avoid loading whole file into memory
         let mut data = match fs::File::create(&path).await {
@@ -204,6 +233,23 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
                 continue;
             }
         };
+
+        // Для шифрованных файлов пишем заголовок: MAGIC(4) + случайная база nonce(8).
+        if enc_key.is_some() {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = data.write_all(crypto::MAGIC).await {
+                drop(data);
+                let _ = fs::remove_file(&path).await;
+                errors.push(format!("Ошибка записи заголовка {name}: {e}"));
+                continue;
+            }
+            if let Err(e) = data.write_all(&nonce_base).await {
+                drop(data);
+                let _ = fs::remove_file(&path).await;
+                errors.push(format!("Ошибка записи заголовка {name}: {e}"));
+                continue;
+            }
+        }
 
         let mut written: usize = 0;
         let mut failed = false;
@@ -219,7 +265,28 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
                         ));
                         break;
                     }
-                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut data, &chunk).await {
+                    plain_size += chunk.len() as u64;
+                    // Шифруем чанк на лету, если ключ включён. Формат блока: len_u32_le + ciphertext+tag.
+                    let out_buf: Vec<u8> = match &enc_key {
+                        Some(key) => {
+                            match crypto::encrypt_chunk(key, &nonce_base, seq, &chunk) {
+                                Ok(enc) => {
+                                    seq += 1;
+                                    let mut buf = Vec::with_capacity(4 + enc.len());
+                                    buf.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+                                    buf.extend_from_slice(&enc);
+                                    buf
+                                }
+                                Err(e) => {
+                                    failed = true;
+                                    errors.push(format!("Ошибка шифрования {name}: {e}"));
+                                    break;
+                                }
+                            }
+                        }
+                        None => chunk.to_vec(),
+                    };
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut data, &out_buf).await {
                         failed = true;
                         errors.push(format!("Ошибка записи {name}: {e}"));
                         break;
@@ -238,7 +305,19 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
         if failed {
             let _ = fs::remove_file(&path).await;
         } else {
-            saved.push(name);
+            // Для шифрованных файлов пишем метаданные (имя/MIME/размер),
+            // чтобы при скачивании вернуть обычный файл с правильным типом.
+            if enc_key.is_some() {
+                let meta = crypto::FileMeta {
+                    name: stored_name.clone(),
+                    content_type,
+                    size: plain_size,
+                };
+                if let Ok(json) = serde_json::to_vec(&meta) {
+                    let _ = fs::write(crypto::meta_path(&dir, &stored_name), json).await;
+                }
+            }
+            saved.push(stored_name);
         }
     }
 
@@ -301,7 +380,8 @@ async fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
     }
 }
 
-/// Download a stored file by name.
+/// Download a stored file by name. If the file is encrypted on disk —
+/// transparently decrypt it on the fly, so the user just gets a normal file.
 async fn download(State(state): State<AppState>, AxPath(raw): AxPath<String>) -> Response {
     let dir = match state.storage_dir() {
         None => return Html(state.templates.not_configured).into_response(),
@@ -318,22 +398,126 @@ async fn download(State(state): State<AppState>, AxPath(raw): AxPath<String>) ->
             .into_response();
     };
 
-    match tokio::fs::File::open(&path).await {
-        Ok(file) => {
-            let io = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-            let disposition = format!("attachment; filename=\"{}\"", sanitize_header(filename));
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/octet-stream"),
-                    (header::CONTENT_DISPOSITION, disposition.as_str()),
-                ],
-                io,
+    // Шифрованный файл? Проверяем магическую сигнатуру в начале файла.
+    let enc_key = state.encryption_key();
+    let encrypted = head_is_magic(&path).await.unwrap_or(false);
+
+    if encrypted {
+        let Some(key) = enc_key else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "Файл зашифрован, но шифрование сейчас выключено или ключ недоступен.",
             )
-                .into_response()
+                .into_response();
+        };
+        // Читаем метаданные (content-type оригинала).
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let meta = fs::read(crypto::meta_path(&dir, &name))
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<crypto::FileMeta>(&b).ok());
+        let content_type = meta
+            .as_ref()
+            .map(|m| m.content_type.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        match decrypt_whole_file(&path, &key).await {
+            Ok(plain) => {
+                let disposition = format!("attachment; filename=\"{}\"", sanitize_header(&name));
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (header::CONTENT_DISPOSITION, disposition),
+                    ],
+                    plain,
+                )
+                    .into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         }
-        Err(_) => (StatusCode::NOT_FOUND, "Не удалось открыть файл").into_response(),
+    } else {
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                let io = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                let disposition = format!("attachment; filename=\"{}\"", sanitize_header(filename));
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream"),
+                        (header::CONTENT_DISPOSITION, disposition.as_str()),
+                    ],
+                    io,
+                )
+                    .into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, "Не удалось открыть файл").into_response(),
+        }
+    }
+}
+
+/// Проверить первые байты файла на магическую сигнатуру `FSenc1`.
+async fn head_is_magic(path: &std::path::Path) -> Option<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut f = fs::File::open(path).await.ok()?;
+    let len = f.metadata().await.ok()?.len();
+    if len < crypto::MAGIC.len() as u64 {
+        return Some(false);
+    }
+    let mut buf = [0u8; 6];
+    f.read_exact(&mut buf).await.ok()?;
+    Some(buf == *crypto::MAGIC)
+}
+
+/// Расшифровать весь файл в оперативную память и вернуть как тело ответа.
+/// Формат на диске: MAGIC(4) | base(8) | для каждого чанка: len_u32_le + ciphertext+tag.
+/// (У нас лимит 100 МБ на файл — приемлемо.)
+async fn decrypt_whole_file(path: &std::path::Path, key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = fs::File::open(path).await.map_err(|e| format!("не удалось открыть файл: {e}"))?;
+    f.seek(std::io::SeekFrom::Start(crypto::MAGIC.len() as u64)).await.map_err(|e| e.to_string())?;
+    let mut base = [0u8; 8];
+    f.read_exact(&mut base).await.map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    let mut seq: u32 = 0;
+    loop {
+        // длина следующего шифротекста (u32 LE); конец потока — EOF
+        match read_u32_le(&mut f).await {
+            Ok(Some(clen)) => {
+                let mut cbuf = vec![0u8; clen as usize];
+                f.read_exact(&mut cbuf).await.map_err(|e| e.to_string())?;
+                let dec = crypto::decrypt_chunk(key, &base, seq, &cbuf)?;
+                out.extend_from_slice(&dec);
+                seq += 1;
+            }
+            Ok(None) => break, // EOF — всё прочитано
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Прочитать u32 little-endian; `None` если достигнут EOF ровно на границе.
+async fn read_u32_le<R: tokio::io::AsyncReadExt + Unpin>(r: &mut R) -> Result<Option<u32>, String> {
+    let mut b = [0u8; 4];
+    // читаем побайтово, чтобы отличить «чистый EOF» от «оборванный заголовок»
+    let mut got = 0usize;
+    while got < 4 {
+        match r.read(&mut b[got..got + 1]).await {
+            Ok(0) => break,
+            Ok(_) => got += 1,
+            Err(e) => return Err(format!("ошибка чтения: {e}")),
+        }
+    }
+    if got == 0 {
+        Ok(None) // EOF
+    } else if got < 4 {
+        Err("битый зашифрованный файл (оборванный блок)".to_string())
+    } else {
+        Ok(Some(u32::from_le_bytes(b)))
     }
 }
 
@@ -358,6 +542,8 @@ struct AdminForm {
     directory: Option<String>,
     clear: Option<String>,
     new_password: Option<String>,
+    /// Чекбокс «Шифровать файлы на диске» (значение «1», если отмечен).
+    encrypt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -376,6 +562,8 @@ async fn admin_page(State(state): State<AppState>, query: axum::extract::Query<A
         Some("saved") => Some("Настройка сохранена: обмен файлами работает."),
         Some("cleared") => Some("Настройка сброшена: пользователи снова видят заглушку."),
         Some("password") => Some("Пароль администратора обновлён."),
+        Some("enc_on") => Some("Шифрование включено: новые файлы будут зашифрованы (AES-256-GCM)."),
+        Some("enc_off") => Some("Шифрование выключено: новые файлы сохраняются как есть."),
         _ => None,
     };
     render_admin(&state, current.as_deref(), message, None)
@@ -398,6 +586,17 @@ async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>
             return render_admin_error(&state, &format!("Не удалось сохранить конфиг: {e}"));
         }
         return Redirect::to("/admin?msg=cleared").into_response();
+    }
+
+    // Шифрование — отдельная кнопка-переключатель (name="toggle_encrypt"),
+    // чтобы не зависеть от поведения чекбоксов в форме.
+    if form.encrypt.as_deref() == Some("toggle") {
+        let new_state = !state.config().encryption.enabled;
+        if let Err(e) = state.set_encryption(new_state) {
+            return render_admin_error(&state, &format!("Не удалось сохранить настройку шифрования: {e}"));
+        }
+        return Redirect::to(if new_state { "/admin?msg=enc_on" } else { "/admin?msg=enc_off" })
+            .into_response();
     }
 
     let raw = form.directory.unwrap_or_default().trim().to_string();
@@ -449,6 +648,12 @@ fn render_admin(
     } else {
         "Пароль ещё не установлен — задайте его прямо сейчас (минимум 6 символов)."
     };
+    let cfg = state.config();
+    let enc_badge = if cfg.encryption.enabled {
+        "<span class=\"ok\">Шифрование включено (AES-256-GCM). Новые файлы шифруются на диске; при скачивании сервер расшифровывает их сам — пользователь получает обычный файл.</span>"
+    } else {
+        "<span class=\"banner\">Шифрование выключено: файлы лежат на диске в открытом виде.</span>"
+    };
 
     Html(templates::render(
         &state.templates.admin,
@@ -457,6 +662,8 @@ fn render_admin(
             ("status", status),
             ("current", &value),
             ("pwd_hint", &templates::html_escape(pwd_hint)),
+            ("enc_badge", enc_badge),
+            ("enc_button", if cfg.encryption.enabled { "Выключить шифрование" } else { "Включить шифрование" }),
         ],
     ))
     .into_response()

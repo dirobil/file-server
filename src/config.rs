@@ -27,6 +27,17 @@ pub struct AdminConfig {
     pub password_hash: String,
 }
 
+/// Настройки шифрования файлов на диске.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// Включено ли шифрование новых загружаемых файлов (AES-256-GCM).
+    pub enabled: bool,
+    /// Ключ в hex (64 символа). Пустой — ключ ещё не создавался.
+    /// Сам ключ генерируется ОС; в открытом виде нигде, кроме этого файла (0600), не хранится.
+    pub key_hex: String,
+}
+
 /// Полная конфигурация сервера.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,6 +46,7 @@ pub struct Config {
     /// Выбранная админом директория для хранения файлов (`None` — сервер не настроен).
     pub storage_dir: Option<PathBuf>,
     pub admin: AdminConfig,
+    pub encryption: EncryptionConfig,
 }
 
 impl Config {
@@ -44,7 +56,16 @@ impl Config {
             version: CONFIG_VERSION,
             storage_dir,
             admin: AdminConfig::default(),
+            encryption: EncryptionConfig::default(),
         }
+    }
+
+    /// Рабочий 32-байтный ключ, если включён и корректный hex задан.
+    pub fn encryption_key(&self) -> Option<[u8; 32]> {
+        if !self.encryption.enabled {
+            return None;
+        }
+        crate::crypto::key_from_hex(&self.encryption.key_hex)
     }
 
     /// Есть ли уже установленный пароль администратора.
@@ -127,6 +148,13 @@ fn render_toml(cfg: &Config) -> Result<String, String> {
             "password_hash = {}\n",
             quoted(&cfg.admin.password_hash)
         ));
+    }
+    out.push_str("\n[encryption]\n");
+    out.push_str(&format!("enabled = {} # шифрование файлов на диске (AES-256-GCM)\n", cfg.encryption.enabled));
+    if cfg.encryption.key_hex.is_empty() {
+        out.push_str("key_hex = \"\" # ключ создаётся автоматически при включении шифрования\n");
+    } else {
+        out.push_str(&format!("key_hex = {}\n", quoted(&cfg.encryption.key_hex)));
     }
     Ok(out)
 }
