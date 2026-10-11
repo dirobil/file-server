@@ -7,15 +7,25 @@
 //!   - static/style.css           — общие стили (подключаются по ссылке /style.css)
 //!
 //! Dynamic parts are inserted by replacing `{{placeholder}}` markers.
+//!
+//! The files are embedded into the binary at compile time via `include_str!`,
+//! so the server works from any working directory and ships as a single file.
+//! The CSS is embedded the same way and served at `/style.css` from memory.
 
 use std::collections::HashMap;
 
-/// Load a template file from `static/`. Called once at startup, results are cached in AppState.
-pub fn load_template(name: &str) -> String {
-    let path = format!("static/{name}");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read template {path}: {e}"))
+/// Return the compiled-in contents of a template from `static/`.
+pub fn load_template(name: &str) -> &'static str {
+    match name {
+        "not_configured.html" => include_str!("../static/not_configured.html"),
+        "main_page.html" => include_str!("../static/main_page.html"),
+        "admin.html" => include_str!("../static/admin.html"),
+        _ => panic!("unknown template: {name}"),
+    }
 }
+
+/// The stylesheet, also embedded into the binary (served at `/style.css`).
+pub const STYLE_CSS: &str = include_str!("../static/style.css");
 
 /// Replace every `{{key}}` marker with its value.
 /// Values must already be HTML-escaped by the caller when needed.

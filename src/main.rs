@@ -7,7 +7,6 @@ use axum::routing::get;
 use axum::{Form, Router};
 use serde::Deserialize;
 use tokio::fs;
-use tower_http::services::ServeDir;
 
 mod state;
 mod templates;
@@ -39,7 +38,10 @@ async fn main() {
         .route("/download/{*name}", get(download))
         .route("/delete/{*name}", axum::routing::post(delete_file))
         .route("/admin", get(admin_page).post(admin_submit))
-        .fallback_service(ServeDir::new("static").append_index_html_on_directories(false))
+        // CSS is embedded into the binary too, so the server needs no files at runtime.
+        .route("/style.css", get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], templates::STYLE_CSS)
+        }))
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
@@ -62,7 +64,7 @@ async fn main() {
 /// Main page. If the server is not configured yet — show the "not configured" stub.
 async fn index(State(state): State<AppState>) -> Response {
     let dir = match state.storage_dir() {
-        None => return Html(state.templates.not_configured.to_string()).into_response(),
+        None => return Html(state.templates.not_configured).into_response(),
         Some(d) => d,
     };
 
@@ -259,7 +261,7 @@ async fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
 /// Download a stored file by name.
 async fn download(State(state): State<AppState>, AxPath(raw): AxPath<String>) -> Response {
     let dir = match state.storage_dir() {
-        None => return Html(state.templates.not_configured.to_string()).into_response(),
+        None => return Html(state.templates.not_configured).into_response(),
         Some(d) => d,
     };
 
