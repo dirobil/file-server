@@ -28,8 +28,6 @@ use std::path::PathBuf;
 pub const MAGIC: &[u8; 6] = b"FSenc1";
 /// Размер nonce AES-GCM.
 const NONCE_LEN: usize = 12;
-/// Размер чанка потока шифрования.
-pub const CHUNK: usize = 64 * 1024;
 
 /// Метаданные зашифрованного файла — лежат в `<storage>/<имя>.meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
