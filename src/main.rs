@@ -12,7 +12,7 @@ use tower_http::services::ServeDir;
 mod state;
 mod templates;
 
-use state::AppState;
+use state::{AppState, Templates};
 
 const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100 MB per file
 
@@ -28,7 +28,9 @@ async fn main() {
         }
     }
 
-    let state = AppState::default();
+    // HTML pages live in static/*.html — load them once at startup.
+    let templates = Templates::load();
+    let state = AppState::new(templates);
     state.set_storage_dir(initial_storage);
 
     let app = Router::new()
@@ -60,14 +62,44 @@ async fn main() {
 /// Main page. If the server is not configured yet — show the "not configured" stub.
 async fn index(State(state): State<AppState>) -> Response {
     let dir = match state.storage_dir() {
-        None => return Html(templates::page_not_configured()).into_response(),
+        None => return Html(state.templates.not_configured.to_string()).into_response(),
         Some(d) => d,
     };
 
     let mut files = list_files(&dir).await;
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    Html(templates::page_main(&dir.display().to_string(), &files, None)).into_response()
+    let files_html = render_file_list(&files);
+    Html(templates::render(
+        &state.templates.main_page,
+        &[
+            ("flash", ""),
+            ("dir", &templates::html_escape(&dir.display().to_string())),
+            ("files", &files_html),
+        ],
+    ))
+    .into_response()
+}
+
+/// Build the file-list fragment (rows of `static/main_page.html`'s {{files}} placeholder).
+fn render_file_list(files: &[(String, u64)]) -> String {
+    if files.is_empty() {
+        return r#"<div class="empty">Пока нет ни одного файла — загрузите первый!</div>"#.to_string();
+    }
+    let items: String = files
+        .iter()
+        .map(|(name, size)| {
+            let esc = templates::html_escape(name);
+            let url = templates::url_encode(name);
+            format!(
+                r#"<li><div><div class="fname">{esc}</div><div class="fsize">{}</div></div>
+<div class="actions"><a class="dl" href="/download/{url}">Скачать</a>
+<button class="danger" onclick="delFile('{url}')">Удалить</button></div></li>"#,
+                templates::human_size(*size)
+            )
+        })
+        .collect();
+    format!(r#"<ul class="files">{items}</ul>"#)
 }
 
 async fn list_files(dir: &PathBuf) -> Vec<(String, u64)> {
@@ -227,7 +259,7 @@ async fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
 /// Download a stored file by name.
 async fn download(State(state): State<AppState>, AxPath(raw): AxPath<String>) -> Response {
     let dir = match state.storage_dir() {
-        None => return Html(templates::page_not_configured()).into_response(),
+        None => return Html(state.templates.not_configured.to_string()).into_response(),
         Some(d) => d,
     };
 
@@ -294,7 +326,7 @@ async fn admin_page(State(state): State<AppState>, query: axum::extract::Query<A
         Some("cleared") => Some("Настройка сброшена: пользователи снова видят заглушку."),
         _ => None,
     };
-    Html(templates::page_admin(current.as_deref(), message, None)).into_response()
+    render_admin(&state, current.as_deref(), message, None)
 }
 
 async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>) -> Response {
@@ -305,21 +337,50 @@ async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>
 
     let raw = form.directory.unwrap_or_default().trim().to_string();
     if raw.is_empty() {
-        return render_admin_error("Укажите путь к директории.");
+        return render_admin_error(&state, "Укажите путь к директории.");
     }
     let path = PathBuf::from(&raw);
     if !path.is_absolute() {
-        return render_admin_error("Путь должен быть абсолютным (начинаться с «/»).");
+        return render_admin_error(&state, "Путь должен быть абсолютным (начинаться с «/»).");
     }
     if let Err(e) = fs::create_dir_all(&path).await {
-        return render_admin_error(&format!("Не удалось создать директорию: {e}"));
+        return render_admin_error(&state, &format!("Не удалось создать директорию: {e}"));
     }
     state.set_storage_dir(Some(path));
     Redirect::to("/admin?msg=saved").into_response()
 }
 
-fn render_admin_error(msg: &str) -> Response {
-    Html(templates::page_admin(None, None, Some(msg))).into_response()
+fn render_admin_error(state: &AppState, msg: &str) -> Response {
+    render_admin(state, None, None, Some(msg))
+}
+
+/// Render `static/admin.html` with escaped dynamic values.
+fn render_admin(
+    state: &AppState,
+    current: Option<&str>,
+    message: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    let msg = match (error, message) {
+        (Some(e), _) => format!("<div class=\"banner\">{}</div>", templates::html_escape(e)),
+        (None, Some(m)) => format!("<div class=\"ok\">{}</div>", templates::html_escape(m)),
+        (None, None) => String::new(),
+    };
+    let value = current.map(templates::html_escape).unwrap_or_default();
+    let status = match current {
+        Some(_) => "<div class=\"ok\">Сервер настроен: обмен файлами работает.</div>",
+        None => "<div class=\"banner\">Сервер не настроен: пользователи видят заглушку.</div>",
+    };
+
+    Html(templates::render(
+        &state.templates.admin,
+        &[
+            ("message", &msg),
+            ("status", status),
+            ("current", &value),
+        ],
+    ))
+    .into_response()
 }
 
 /// Percent-decode a path segment (UTF-8 aware).
