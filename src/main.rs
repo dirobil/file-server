@@ -14,6 +14,7 @@ mod config;
 mod crypto;
 mod state;
 mod templates;
+mod tls;
 
 use auth::AdminCookie;
 use state::{AppState, Templates};
@@ -80,6 +81,11 @@ async fn main() {
         .route("/download/{*name}", get(download))
         // Открытая зона входа — только если пароль уже установлен.
         .route("/login", get(login_page).post(login_submit))
+        // Публичный ECDH-ключ сервера — браузер добавляет его получателем ключа
+        // файла, чтобы зашифрованное «в браузере» можно было скачать позже.
+        .route("/ecdh_pubkey", get(ecdh_pubkey))
+        // PEM самоподписанного сертификата — добавить в доверенные один раз.
+        .route("/ca.crt", get(ca_crt))
         .merge(admin_zone)
         // CSS is embedded into the binary too, so the server needs no files at runtime.
         .route("/style.css", get(|| async {
@@ -99,14 +105,95 @@ async fn main() {
     println!("  Админ-панель: http://{bind}/admin");
     println!("  Конфиг:       {}", config_path.display());
 
-    if let Err(e) = axum::serve(listener, app).await {
+    // HTTPS (нужен для WebCrypto на не-local адресе вроде 192.168.0.16).
+    // Сертификат — самоподписанный, выпускается автоматически при первом включении.
+    let cfg_now = state.config();
+    let https_task = if cfg_now.tls.enabled {
+        let addr = cfg_now.tls.addr.clone();
+        match tls::server_config(&addr) {
+            Ok((tls_cfg, _pem)) => {
+                let https_bind = https_bind_addr(&bind);
+                match tokio::net::TcpListener::bind(&https_bind).await {
+                    Ok(l) => {
+                        println!("  HTTPS:        https://{https_bind}  (сертификат для {addr})");
+                        println!("  Корневой сертификат: https://{https_bind}/ca.crt");
+                        let app2 = app.clone();
+                        Some(tokio::spawn(async move {
+                            let acceptor = tls::TlsListener::new(l, tls_cfg);
+                            if let Err(e) = axum::serve(acceptor, app2.into_make_service()).await {
+                                eprintln!("Ошибка HTTPS-сервера: {e}");
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        eprintln!("Не удалось привязаться к https://{https_bind}: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("HTTPS выключен: {e}");
+                None
+            }
+        }
+    } else {
+        println!("  HTTPS:        выключен (включите в /admin — нужен для шифрования в браузере)");
+        None
+    };
+
+    let result = axum::serve(listener, app).await;
+    if let Some(t) = https_task {
+        t.abort();
+    }
+    if let Err(e) = result {
         eprintln!("Ошибка сервера: {e}");
         std::process::exit(1);
     }
 }
 
+/// Адрес HTTPS-слушателя: тот же хост, порт HTTP + 1000 (3000 → 4000).
+fn https_bind_addr(bind: &str) -> String {
+    match bind.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(p) => format!("{host}:{}", p.saturating_add(1000)),
+            Err(_) => bind.to_string(),
+        },
+        None => bind.to_string(),
+    }
+}
+
+/// Только порт из адреса HTTPS-слушателя (для подсказки в админке).
+fn https_port_from_bind(bind: &str) -> u16 {
+    bind.rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .map(|p| p.saturating_add(1000))
+        .unwrap_or(4000)
+}
+
 /// Main page. If the server is not configured yet — show the "not configured" stub.
-async fn index(State(state): State<AppState>) -> Response {
+async fn index(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Запомним, как именно открыли страницу (https или http, какой хост) —
+    // это определяет доступность WebCrypto для тумблера «Шифрование в браузере».
+    {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let proto = headers
+            .get("x-forwarded-proto")
+            .or_else(|| headers.get("forwarded"))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                if v.contains("https") { "https" } else { "http" }
+            })
+            .unwrap_or("")
+            .to_string();
+        state.note_request_ctx(&host, &proto);
+    }
     let dir = match state.storage_dir() {
         None => return Html(state.templates.not_configured).into_response(),
         Some(d) => d,
@@ -115,20 +202,33 @@ async fn index(State(state): State<AppState>) -> Response {
     let mut files = list_files(&dir).await;
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let files_html = render_file_list(&files);
+    let files_html = render_file_list(&dir, &files);
+    let secure = state.is_secure_context();
     Html(templates::render(
         &state.templates.main_page,
         &[
             ("flash", ""),
             ("dir", &templates::html_escape(&dir.display().to_string())),
             ("files", &files_html),
+            ("tls_enabled", if state.config().tls.enabled { "1" } else { "0" }),
+            (
+                "https_hint",
+                if secure {
+                    ""
+                } else if state.config().tls.enabled {
+                    "<div class=\"banner\">&#9888;&#65039; Шифрование в браузере (WebCrypto) требует HTTPS.                      Откройте эту страницу по адресу <code>https://…</code> — см. ссылку в админ-панели.</div>"
+                } else {
+                    "<div class=\"banner\">&#9888;&#65039; Для шифрования файлов в браузере включите HTTPS                      в <a href=\"/admin\">админ-панели</a>.</div>"
+                },
+            ),
+            ("secure", if secure { "1" } else { "0" }),
         ],
     ))
     .into_response()
 }
 
 /// Build the file-list fragment (rows of `static/main_page.html`'s {{files}} placeholder).
-fn render_file_list(files: &[(String, u64)]) -> String {
+fn render_file_list(files_dir: &PathBuf, files: &[(String, u64)]) -> String {
     if files.is_empty() {
         return r#"<div class="empty">Пока нет ни одного файла — загрузите первый!</div>"#.to_string();
     }
@@ -137,9 +237,14 @@ fn render_file_list(files: &[(String, u64)]) -> String {
         .map(|(name, size)| {
             let esc = templates::html_escape(name);
             let url = templates::url_encode(name);
+            let lock = if crypto::has_ekey(files_dir, name) {
+                r#" <span class="lock" title="Зашифровано в браузере (сквозное шифрование)">&#128274;</span>"#
+            } else {
+                ""
+            };
             format!(
-                r#"<li><div><div class="fname">{esc}</div><div class="fsize">{}</div></div>
-<div class="actions"><a class="dl" href="/download/{url}">Скачать</a>
+                r#"<li><div><div class="fname">{esc}{lock}</div><div class="fsize">{}</div></div>
+<div class="actions"><a class="dl" id="dl-{url}" href="/download/{url}">Скачать</a>
 <button class="danger" onclick="delFile('{url}')">Удалить</button></div></li>"#,
                 templates::human_size(*size)
             )
@@ -155,9 +260,16 @@ async fn list_files(dir: &PathBuf) -> Vec<(String, u64)> {
             if let Ok(meta) = entry.metadata().await {
                 if meta.is_file() {
                     if let Some(name) = entry.file_name().to_str() {
-                        // Файлы метаданных (*.meta.json) — служебные, не показываем.
-                        if name.ends_with(".meta.json") {
+                        // Служебные файлы (метаданные / конверты ключей) не показываем.
+                        if name.ends_with(".meta.json") || name.ends_with(crypto::EKEY_EXT) {
                             continue;
+                        }
+                        // Сквозное шифрование: имя и размер берём из конверта.
+                        if crypto::has_ekey(dir, name) {
+                            if let Some(wm) = read_web_meta(dir, name).await {
+                                out.push((wm.name, wm.size));
+                                continue;
+                            }
                         }
                         // Для шифрованных файлов показываем размер оригинала.
                         let size = match crypto::has_meta(dir, name) {
@@ -213,6 +325,87 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             .content_type()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "application/octet-stream".to_string());
+        // Файл зашифрован в браузере (WebCrypto)? Магическая сигнатура FSweb1.
+        let mut peek = [0u8; 6];
+        let is_web_enc = match field.fill_bytes(&mut peek).await {
+            Ok(()) => peek == *crypto::MAGIC_WEB,
+            Err(_) => false,
+        };
+
+        if is_web_enc {
+            // Сквозное шифрование: сервер хранит только шифртекст + конверт параметров.
+            // Ключ файла знает лишь браузер-отправитель и получатели из конверта.
+            let base_name = if crypto::has_ekey(&dir, &name) {
+                // дубликат имени — добавим суффикс (1), (2)…
+                unique_path(&dir, &name).await
+            } else {
+                dir.join(&name)
+            };
+            let stem = base_name.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+            let ekey = crypto::ekey_path(&dir, &stem);
+            let mut out = match fs::File::create(&base_name).await {
+                Ok(f) => f,
+                Err(e) => {
+                    errors.push(format!("Не удалось создать файл {name}: {e}"));
+                    continue;
+                }
+            };
+            let mut written: usize = 0;
+            let mut failed = false;
+            use tokio::io::AsyncWriteExt;
+            // первые 6 байт уже прочитаны в peek
+            if out.write_all(&peek).await.is_err() {
+                failed = true;
+            }
+            while !failed {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        written += chunk.len();
+                        if written > MAX_FILE_SIZE {
+                            errors.push(format!(
+                                "Файл {name} превышает лимит {} МБ",
+                                MAX_FILE_SIZE / 1024 / 1024
+                            ));
+                            failed = true;
+                            break;
+                        }
+                        if out.write_all(&chunk).await.is_err() {
+                            failed = true;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        errors.push(format!("Ошибка загрузки {name}: {e}"));
+                        failed = true;
+                    }
+                }
+            }
+            // читаем конверт из второго поля формы (meta_<имя>)
+            drop(out);
+            let mut meta_ok = false;
+            {
+                let mf = multipart.next_field().await.ok().flatten();
+                if let Some(mf) = mf {
+                    let fname = mf.name().unwrap_or_default().to_string();
+                    if let Some(orig) = fname.strip_prefix("meta_") {
+                        if let Ok(bytes) = mf.bytes().await {
+                            meta_ok = save_web_meta(&dir, &stem, orig, &bytes).await;
+                        }
+                    }
+                }
+            }
+            if failed || !meta_ok {
+                let _ = fs::remove_file(&base_name).await;
+                let _ = fs::remove_file(&ekey).await;
+                if !meta_ok && !failed {
+                    errors.push(format!("Файл {name}: повреждён конверт ключей"));
+                }
+            } else {
+                saved.push(stem);
+            }
+            continue;
+        }
+
         let path = unique_path(&dir, &name).await;
         // Имя, под которым файл реально лежит на диске (может отличаться из-за дубликатов).
         let stored_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
@@ -360,6 +553,75 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
     }
 }
 
+/// Прочитать конверт сквозного шифрования `<имя>.ekey.json`.
+async fn read_web_meta(dir: &PathBuf, name: &str) -> Option<crypto::WebMeta> {
+    let bytes = fs::read(crypto::ekey_path(dir, name)).await.ok()?;
+    serde_json::from_slice::<crypto::WebMeta>(&bytes).ok()
+}
+
+/// Проверить и сохранить конверт ключей для веб-шифрованного файла.
+/// `orig_name` — имя из формы (`meta_<имя>`), сверяется с именем внутри JSON.
+async fn save_web_meta(dir: &PathBuf, stored: &str, orig_name: &str, json: &[u8]) -> bool {
+    let Ok(meta) = serde_json::from_slice::<crypto::WebMeta>(json) else {
+        return false;
+    };
+    // Имя в конверте должно совпадать с тем, под которым пришёл файл,
+    // и быть безопасным (без путей/управляющих символов).
+    if meta.name != orig_name || AppState::sanitize_name(&meta.name) != meta.name {
+        return false;
+    }
+    if meta.recipients.is_empty() || meta.recipients.len() > 64 {
+        return false;
+    }
+    // Все публичные ключи получателей обязаны быть валидными точками P-256.
+    for r in &meta.recipients {
+        let Some(sec1) = crypto::b64url_decode(&r.pubkey) else {
+            return false;
+        };
+        if crypto::validate_ecdh_public(&sec1).is_none() {
+            return false;
+        }
+    }
+    if crypto::b64url_decode(&meta.iv).map(|v| v.len() != 12).unwrap_or(true) {
+        return false;
+    }
+    let compact = match serde_json::to_vec(&meta) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    fs::write(crypto::ekey_path(dir, stored), compact).await.is_ok()
+}
+
+/// Публичный ECDH-ключ сервера (P-256, uncompressed SEC1 base64url).
+/// Браузер добавляет сервера получателем ключа каждого сквозного файла,
+/// чтобы файл можно было скачать позже с любого устройства.
+async fn ecdh_pubkey(State(state): State<AppState>) -> Response {
+    let json = state.server_ecdh_pub();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        json,
+    )
+        .into_response()
+}
+
+/// PEM сертификата сервера — пользователь может один раз добавить его
+/// в доверенные на устройстве, тогда предупреждение браузера не появится.
+async fn ca_crt(State(state): State<AppState>) -> Response {
+    match tls::server_config(&state.config().tls.addr) {
+        Ok((_cfg, pem)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/x-pem-file"),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"file-server.crt\""),
+            ],
+            String::from_utf8_lossy(&pem).into_owned(),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
 /// Pick a non-colliding path inside the storage dir (`name`, `name (1)`, `name (2)`, …).
 async fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
     let candidate = dir.join(name);
@@ -397,6 +659,23 @@ async fn download(State(state): State<AppState>, AxPath(raw): AxPath<String>) ->
         )
             .into_response();
     };
+
+    // Сквозное шифрование «в браузере»: сервер не знает ключ — отдаём шифртекст
+    // как есть; браузер получателя расшифрует его сам (WebCrypto).
+    if crypto::has_ekey(&dir, path.file_name().and_then(|n| n.to_str()).unwrap_or("")) {
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                let io = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    io,
+                )
+                    .into_response();
+            }
+            Err(_) => return (StatusCode::NOT_FOUND, "Не удалось открыть файл").into_response(),
+        }
+    }
 
     // Шифрованный файл? Проверяем магическую сигнатуру в начале файла.
     let enc_key = state.encryption_key();
@@ -544,6 +823,10 @@ struct AdminForm {
     new_password: Option<String>,
     /// Чекбокс «Шифровать файлы на диске» (значение «1», если отмечен).
     encrypt: Option<String>,
+    /// Переключатель HTTPS («toggle» при нажатии кнопки).
+    tls: Option<String>,
+    /// Адрес (IP/имя) для TLS-сертификата.
+    tls_addr: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -564,9 +847,15 @@ async fn admin_page(State(state): State<AppState>, query: axum::extract::Query<A
         Some("password") => Some("Пароль администратора обновлён."),
         Some("enc_on") => Some("Шифрование включено: новые файлы будут зашифрованы (AES-256-GCM)."),
         Some("enc_off") => Some("Шифрование выключено: новые файлы сохраняются как есть."),
+        Some("tls_on") => Some("HTTPS включён. Откройте https://адрес:порт и примите сертификат один раз — после этого доступен тумблер «Шифрование в браузере»."),
+        Some("tls_off") => Some("HTTPS выключен."),
+        Some("tls_addr") => Some("Адрес для сертификата обновлён. При следующем перезапуске будет выпущен новый сертификат."),
+        Some(e) if e.starts_with("tls_err:") => Some(&format!("Не удалось включить HTTPS: {}", &e["tls_err:".len()..])),
         _ => None,
     };
-    render_admin(&state, current.as_deref(), message, None)
+    // сообщение может быть сформировано локально — копируем до заимствования
+    let message_owned = message.map(|s| s.to_string());
+    render_admin(&state, current.as_deref(), message_owned.as_deref(), None)
 }
 
 async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>) -> Response {
@@ -597,6 +886,26 @@ async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>
         }
         return Redirect::to(if new_state { "/admin?msg=enc_on" } else { "/admin?msg=enc_off" })
             .into_response();
+    }
+
+    // HTTPS — отдельная кнопка-переключатель; адрес сертификата можно менять отдельно.
+    if form.tls.as_deref() == Some("toggle") {
+        let new_state = !state.config().tls.enabled;
+        if let Err(e) = state.set_tls(new_state) {
+            return Redirect::to(&format!("/admin?msg=tls_err:{}", templates::url_encode(&e)))
+                .into_response();
+        }
+        return Redirect::to(if new_state { "/admin?msg=tls_on" } else { "/admin?msg=tls_off" })
+            .into_response();
+    }
+    if let Some(addr) = form.tls_addr.map(|a| a.trim().to_string()).filter(|a| !a.is_empty()) {
+        let cur = state.config().tls.addr.clone();
+        if cur != addr {
+            if let Err(e) = state.set_tls_addr(&addr) {
+                return render_admin_error(&state, &format!("Не удалось сохранить адрес TLS: {e}"));
+            }
+            return Redirect::to("/admin?msg=tls_addr").into_response();
+        }
     }
 
     let raw = form.directory.unwrap_or_default().trim().to_string();
@@ -655,6 +964,19 @@ fn render_admin(
         "<span class=\"banner\">Шифрование выключено: файлы лежат на диске в открытом виде.</span>"
     };
 
+    let https_url = match std::env::var("BIND") {
+        Ok(b) => format!("https://{}:{}", b.rsplit_once(':').map(|(h, _)| h).unwrap_or("localhost"), https_port_from_bind(&b)),
+        Err(_) => format!("https://{}:4000", cfg.tls.addr),
+    };
+    let tls_badge = if cfg.tls.enabled {
+        format!(
+            "<span class=\"ok\">HTTPS включён: <a href=\"{https_url}\" target=\"_blank\">{https_url}</a>              (сертификат для <code>{}</code>). При первом открытии браузер покажет предупреждение —              нажмите «Дополнительно → Перейти на сайт», либо один раз добавьте сертификат из              <a href=\"/ca.crt\">/ca.crt</a> в доверенные на устройстве.              Только на HTTPS-адресе работает тумблер «Шифрование в браузере».</span>",
+            templates::html_escape(&cfg.tls.addr)
+        )
+    } else {
+        "<span class=\"banner\">HTTPS выключен. Без него страница по IP-адресу (например, http://192.168.0.16)          не сможет использовать WebCrypto — браузер разрешает это только на HTTPS или localhost.</span>".to_string()
+    };
+
     Html(templates::render(
         &state.templates.admin,
         &[
@@ -664,6 +986,9 @@ fn render_admin(
             ("pwd_hint", &templates::html_escape(pwd_hint)),
             ("enc_badge", enc_badge),
             ("enc_button", if cfg.encryption.enabled { "Выключить шифрование" } else { "Включить шифрование" }),
+            ("tls_badge", &tls_badge),
+            ("tls_button", if cfg.tls.enabled { "Выключить HTTPS" } else { "Включить HTTPS" }),
+            ("tls_addr", &templates::html_escape(&cfg.tls.addr)),
         ],
     ))
     .into_response()

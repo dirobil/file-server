@@ -26,6 +26,21 @@
 <p class="sub">Ключ хранится в конфиг-файле сервера; без него зашифрованные файлы не восстановить.
 Уже загруженные файлы перешифруются только при новой загрузке.</p>
 </div>
+<div class="card" style="margin-top:16px">
+<h1 style="font-size:18px">HTTPS и шифрование в браузере (WebCrypto)</h1>
+<p>{{tls_badge}}</p>
+<form method="post" action="/admin" style="margin-top:10px">
+<button class="secondary" type="submit" name="tls" value="toggle">{{tls_button}}</button>
+</form>
+<form method="post" action="/admin" style="margin-top:10px;display:flex;gap:10px;align-items:center">
+<input class="dir" type="text" name="tls_addr" value="{{tls_addr}}" placeholder="192.168.0.16">
+<button type="submit">Сменить адрес сертификата</button>
+</form>
+<p class="sub">Браузер разрешает WebCrypto API только на HTTPS или localhost. Самоподписанный
+сертификат выпускается автоматически для указанного адреса; при первом открытии https-страницы
+примите его («Дополнительно → Перейти на сайт») либо добавьте <a href="/ca.crt">/ca.crt</a>
+в доверенные. После этого на главной появится рабочий тумблер «Шифровать в браузере».</p>
+</div>
 <p class="sub" style="margin-top:14px"><a href="/logout">Выйти из админ-сессии</a></p>
 </div>
 </div></body></html>

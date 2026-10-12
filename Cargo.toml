@@ -17,3 +17,12 @@ rand = "0.9"
 argon2 = "0.5"
 aes-gcm = "0.10"
 futures-util = "0.3"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "http1", "http2"] }
+http = "1"
+p256 = { version = "0.13", features = ["ecdh"] }
+base64 = "0.22"

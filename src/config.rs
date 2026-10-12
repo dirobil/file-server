@@ -38,6 +38,23 @@ pub struct EncryptionConfig {
     pub key_hex: String,
 }
 
+/// Настройки HTTPS (TLS) — нужны, чтобы браузер дал доступ к WebCrypto API
+/// на адресе вида 192.168.0.16 (не localhost).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Поднимать ли дополнительный HTTPS-слушатель рядом с HTTP.
+    pub enabled: bool,
+    /// Адрес (IP или имя), для которого выпускается самоподписанный сертификат.
+    pub addr: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self { enabled: false, addr: crate::tls::DEFAULT_TLS_ADDR.to_string() }
+    }
+}
+
 /// Полная конфигурация сервера.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -47,6 +64,7 @@ pub struct Config {
     pub storage_dir: Option<PathBuf>,
     pub admin: AdminConfig,
     pub encryption: EncryptionConfig,
+    pub tls: TlsConfig,
 }
 
 impl Config {
@@ -57,6 +75,7 @@ impl Config {
             storage_dir,
             admin: AdminConfig::default(),
             encryption: EncryptionConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 
@@ -156,6 +175,9 @@ fn render_toml(cfg: &Config) -> Result<String, String> {
     } else {
         out.push_str(&format!("key_hex = {}\n", quoted(&cfg.encryption.key_hex)));
     }
+    out.push_str("\n[tls]\n");
+    out.push_str(&format!("enabled = {} # HTTPS-слушатель (нужен для WebCrypto на IP-адресе)\n", cfg.tls.enabled));
+    out.push_str(&format!("addr = {}\n", quoted(&cfg.tls.addr)));
     Ok(out)
 }
 
