@@ -387,11 +387,14 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
         } else {
             "Ни один файл не был загружен"
         };
-        (
-            StatusCode::BAD_REQUEST,
-            format!("{msg}: {}", errors.join("; ")),
-        )
-            .into_response()
+        // Если все файлы отклонены из-за размера — отвечаем корректным 413,
+        // чтобы страница загрузки показала точный текст лимита.
+        let status = if errors.iter().all(|e| e.contains("превышает лимит")) {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, format!("{msg}: {}", errors.join("; "))).into_response()
     }
 }
 
