@@ -24,6 +24,11 @@ use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// P-256 для ECDH — используется только при «сквозном» шифровании в браузере:
+// сервер помогает доставить симметричный ключ, но сам его не видит.
+use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use p256::{EncodedPoint, PublicKey};
+
 /// Магическая сигнатура зашифованных файлов (первые 6 байт на диске).
 pub const MAGIC: &[u8; 6] = b"FSenc1";
 /// Размер nonce AES-GCM.
@@ -103,6 +108,88 @@ pub fn has_meta(dir: &PathBuf, name: &str) -> bool {
     meta_path(dir, name).is_file()
 }
 
+// ==================== «Сквозное» шифрование в браузере (WebCrypto) ====================
+//
+// Когда пользователь включает тумблер «Шифрование в браузере», файл шифруется
+// WebCrypto ещё ДО отправки (AES-GCM 256), а ключ файла передается только
+// получателю через ECDH P-256 + HKDF (см. JS в main_page.html). Сервер при этом:
+//   * не знает ключей и НЕ может расшифровать такой файл;
+//   * хранит зашифрованный blob как есть + JSON-«конверт» `<имя>.ekey.json`
+//     с публичными параметрами, нужными для скачивания (iv, список получателей);
+//   * на `/ecdh_pubkey` отдаёт свой временный публичный ECDH-ключ, чтобы
+//     браузер мог добавить сервера в список получателей — иначе файл нельзя
+//     будет скачать после закрытия вкладки.
+// Файлы, зашифрованные в браузере, помечаются magic `FSweb1` и НЕ переименовываются
+// сервером (имя лежит внутри конверта) — поэтому ссылка на них всегда живая.
+
+/// Магическая сигнатура файлов, зашифрованных на стороне браузера.
+pub const MAGIC_WEB: &[u8; 6] = b"FSweb1";
+/// Расширение файла-конверта с параметрами сквозного шифрования.
+pub const EKEY_EXT: &str = ".ekey.json";
+
+/// Параметры одного ECDH-получателя симметричного ключа файла.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recipient {
+    /// Имя кривой (запас на будущее), сейчас всегда "P-256".
+    pub curve: String,
+    /// Публичный ключ получателя, uncompressed SEC1 (65 байт), base64url.
+    pub pubkey: String,
+    /// Случайная соль HKDF (16 байт), base64url.
+    pub salt: String,
+    /// AES-GCM iv для обёртки ключа (12 байт), base64url.
+    pub iv: String,
+    /// Зашифрованный ключ файла + GCM-тег, base64url.
+    pub wrapped_key: String,
+}
+
+/// Конверт сквозного шифрования — `<имя>.ekey.json` рядом с файлом.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebMeta {
+    /// Оригинальное имя файла (сервер его не менял — но всё равно храним).
+    pub name: String,
+    pub content_type: String,
+    /// Размер исходного файла.
+    pub size: u64,
+    /// AES-GCM iv для чанков основного потока (первый чанк), base64url.
+    /// Последующие чанки сдвигают счётчик (big-endian инкремент последних 8 байт).
+    pub iv: String,
+    pub recipients: Vec<Recipient>,
+}
+
+pub fn ekey_path(dir: &PathBuf, name: &str) -> PathBuf {
+    dir.join(format!("{name}{EKEY_EXT}"))
+}
+
+pub fn has_ekey(dir: &PathBuf, name: &str) -> bool {
+    ekey_path(dir, name).is_file()
+}
+
+/// Баз64url без паддингов (то же кодирование, что `b64e` в JS на странице).
+pub fn b64url_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+/// Разобрать баз64url; `None` если строка битая.
+pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .ok()
+}
+
+/// Проверить, что указанный публичный ключ валиден (точка на кривой P-256),
+/// и вернуть его SEC1-представление. Защита от мусора/битых данных в конверте.
+pub fn validate_ecdh_public(sec1: &[u8]) -> Option<Vec<u8>> {
+    let point = EncodedPoint::from_bytes(sec1).ok()?;
+    let pk = PublicKey::from_encoded_point(&point);
+    if pk.is_some().into() {
+        Some(pk.unwrap().to_encoded_point(false).as_bytes().to_vec())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +231,30 @@ mod tests {
         assert_eq!(key_from_hex(&hex).unwrap(), key);
         assert!(key_from_hex("not-hex").is_none());
         assert!(key_from_hex("ab").is_none());
+    }
+
+    #[test]
+    fn b64url_roundtrip_matches_webcrypto_style() {
+        let data = [0u8, 1, 250, 255, 42];
+        let enc = b64url_encode(&data);
+        assert!(!enc.contains('='));
+        assert!(!enc.contains('+'));
+        assert!(!enc.contains('/'));
+        assert_eq!(b64url_decode(&enc).unwrap(), data.to_vec());
+        assert!(b64url_decode("!!!bad!!!").is_none());
+    }
+
+    #[test]
+    fn ecdh_public_validation() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::{PublicKey, SecretKey};
+        let sk = SecretKey::random(&mut rand::rngs::OsRng);
+        let pk = PublicKey::from(sk.as_affine());
+        let sec1 = pk.to_encoded_point(false).as_bytes().to_vec();
+        assert_eq!(sec1.len(), 65);
+        assert_eq!(validate_ecdh_public(&sec1).unwrap(), sec1);
+        // мусор — не ключ
+        assert!(validate_ecdh_public(&[0u8; 33]).is_none());
+        assert!(validate_ecdh_public(&sec1[..10]).is_none());
     }
 }

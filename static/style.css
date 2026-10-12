@@ -29,3 +29,13 @@ nav.top a{color:#3b82f6;text-decoration:none;font-weight:600}
 .empty{color:#94a3b8;text-align:center;padding:20px}
 progress{width:100%;margin-top:14px;height:8px}
 .icon{font-size:40px;margin-bottom:12px}
+/* тумблер «Шифровать в браузере» */
+.switch-row{display:flex;align-items:center;gap:10px;margin-top:14px;cursor:pointer}
+.switch-row input[type=checkbox]{width:42px;height:22px;appearance:none;background:#cbd5e1;border-radius:999px;position:relative;transition:background .2s;outline:none;margin:0}
+.switch-row input[type=checkbox]::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left .2s}
+.switch-row input[type=checkbox]:checked{background:#16a34a}
+.switch-row input[type=checkbox]:checked::after{left:23px}
+.switch-row input[type=checkbox]:disabled{background:#e5e7eb;cursor:not-allowed}
+.switch-label{font-weight:600;color:#1f2937}
+.switch-state{color:#6b7280;font-size:14px}
+.lock{color:#b45309}

@@ -6,20 +6,122 @@
 <a href="/admin">Админ-панель &rarr;</a></nav>
 <div class="container">
 {{flash}}
+{{https_hint}}
 <div class="card">
 <h1>Загрузить файл</h1>
 <p class="sub">Хранилище: <code>{{dir}}</code></p>
+<label class="switch-row" title="Файл шифруется в вашем браузере (WebCrypto AES-GCM) до отправки; сервер не видит содержимое">
+<input type="checkbox" id="encToggle">
+<span class="switch-label">Шифровать в браузере (WebCrypto)</span>
+<span class="switch-state" id="encState">выкл.</span>
+</label>
+<p class="sub" id="encHint">Нужен HTTPS или localhost — на http://адрес браузер не даёт использовать WebCrypto.</p>
 <div class="dropzone" id="dz">Перетащите файлы сюда или нажмите, чтобы выбрать
 <input type="file" id="fin" multiple></div>
 <progress id="prog" max="100" value="0" style="display:none"></progress>
 </div>
 <div class="card">
 <h1>Доступные файлы</h1>
-<p class="sub">Нажмите «Скачать», чтобы получить файл.</p>
+<p class="sub">Нажмите «Скачать», чтобы получить файл. Файлы с &#128274; расшифровываются прямо в браузере.</p>
 {{files}}
 </div>
 </div>
 <script>
+const SECURE = '{{secure}}' === '1';          // страница открыта по https/localhost?
+const TLS_ON = '{{tls_enabled}}' === '1';     // HTTPS на сервере включён?
+const MAGIC_WEB = [0x46,0x53,0x77,0x65,0x62,0x31]; // "FSweb1"
+const CHUNK = 64 * 1024;
+
+// ---------- тумблер ----------
+const encToggle = document.getElementById('encToggle');
+const encState = document.getElementById('encState');
+function saveToggle(){ try{ localStorage.setItem('fs_enc', encToggle.checked ? '1':'0'); }catch(e){} }
+if(!SECURE){
+  encToggle.disabled = true;
+  encToggle.checked = false;
+  document.getElementById('encHint').textContent = TLS_ON
+    ? 'HTTPS включён на сервере — откройте страницу по адресу https://… (см. админ-панель), и тумблер станет доступен.'
+    : 'Для этого тумблера администратор должен включить HTTPS в админ-панели (или откройте сервер по localhost).';
+} else {
+  document.getElementById('encHint').textContent =
+    'Файл будет зашифрован в вашем браузере (AES-GCM 256) до отправки. Сервер хранит только шифртекст и не может его прочитать.';
+  try{ encToggle.checked = localStorage.getItem('fs_enc') === '1'; }catch(e){}
+  encToggle.addEventListener('change', ()=>{ encState.textContent = encToggle.checked?'вкл.':'выкл.'; saveToggle(); });
+  encState.textContent = encToggle.checked?'вкл.':'выкл.';
+}
+
+// ---------- утилиты base64url / nonce ----------
+function b64e(buf){ let s=''; const b=new Uint8Array(buf); for(const x of b) s+=String.fromCharCode(x);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+function b64d(str){ str=str.replace(/-/g,'+').replace(/_/g,'/'); while(str.length%4)str+='=';
+  const bin=atob(str); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i); return u; }
+function nextNonce(iv){ // GCM-счётчик: big-endian инкремент последних 8 байт iv
+  const n=iv.slice(); let c=1; for(let i=n.length-1;i>=0&&c;i--){ const v=n[i]+c; n[i]=v&0xff; c=v>>8; } return n; }
+
+// ---------- ECDH-ключ браузера (идентичность получателя) ----------
+async function getIdentity(){
+  let cached; try{ cached = localStorage.getItem('fs_ekey_id'); }catch(e){}
+  if(cached){ try{ return await crypto.subtle.importKey('jwk', JSON.parse(cached), {name:'ECDH',namedCurve:'P-256'}, true, ['deriveBits']); }catch(e){} }
+  const id = await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'}, true, ['deriveBits']);
+  try{ localStorage.setItem('fs_ekey_id', JSON.stringify(await crypto.subtle.exportKey('jwk', id.privateKey))); }catch(e){}
+  return id.publicKey;
+}
+async function serverPub(){
+  const r = await fetch('/ecdh_pubkey'); const j = await r.json(); return j.pubkey; // base64url uncompressed SEC1
+}
+async function importRawPub(b64){
+  return crypto.subtle.importKey('raw', b64d(b64), {name:'ECDH',namedCurve:'P-256'}, true, []);
+}
+// HKDF(ECDH(shared)) -> AES-256-GCM ключ
+async function deriveAes(sharedBits, salt){
+  const hk = await crypto.subtle.importKey('raw', sharedBits, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'HKDF', hash:'SHA-256', salt, info:new TextEncoder().encode('fs-e2e-v1')},
+    hk, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+
+// ---------- упаковка ключа файла для одного получателя ----------
+async function wrapKeyFor(aesKeyBytes, recipPubB64){
+  const recip = await importRawPub(recipPubB64);
+  const ephem = await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'}, true, ['deriveBits']);
+  const shared = await crypto.subtle.deriveBits({name:'ECDH', public:recip}, ephem, 256);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const kek = await deriveAes(shared, salt);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const wrapped = await crypto.subtle.encrypt({name:'AES-GCM', iv}, kek, aesKeyBytes);
+  const rawEph = await crypto.subtle.exportKey('raw', ephem.publicKey);
+  return { curve:'P-256', pubkey:b64e(rawEph), salt:b64e(salt), iv:b64e(iv), wrapped_key:b64e(wrapped) };
+}
+
+// ---------- шифрование файла + конверт ----------
+async function exportOurPub(){
+  const id = await getIdentity();
+  const raw = await crypto.subtle.exportKey('raw', id);
+  return b64e(raw);
+}
+async function encryptFile(file){
+  const aesKey = await crypto.subtle.generateKey({name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
+  const keyBytes = new Uint8Array(await crypto.subtle.exportKey('raw', aesKey));
+  const iv0 = crypto.getRandomValues(new Uint8Array(12));
+  const recipients = [];
+  for(const pub of [await serverPub(), await exportOurPub()]){
+    recipients.push(await wrapKeyFor(keyBytes, pub));
+  }
+  keyBytes.fill(0);
+  const parts=[]; parts.push(new Uint8Array(MAGIC_WEB).buffer);
+  let pos=0, iv=iv0;
+  while(pos < file.size){
+    const buf = await file.slice(pos, Math.min(pos+CHUNK, file.size)).arrayBuffer();
+    parts.push(await crypto.subtle.encrypt({name:'AES-GCM', iv}, aesKey, buf));
+    iv = nextNonce(iv); pos += buf.byteLength;
+  }
+  const blob = new Blob(parts);
+  const meta = { name:file.name, content_type:file.type||'application/octet-stream',
+                 size:file.size, iv:b64e(iv0), recipients };
+  return {blob, meta};
+}
+
+// ---------- загрузка ----------
 const dz=document.getElementById('dz'),fin=document.getElementById('fin'),prog=document.getElementById('prog');
 dz.onclick=()=>fin.click();
 dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag')});
@@ -28,7 +130,18 @@ dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag');up
 fin.addEventListener('change',()=>upload(fin.files));
 async function upload(files){
  if(!files.length)return;
- const fd=new FormData();for(const f of files)fd.append('files',f);
+ const fd=new FormData();
+ try{
+  for(const f of files){
+   if(encToggle.checked && SECURE){
+     const {blob, meta} = await encryptFile(f);
+     fd.append('files', blob, f.name);
+     fd.append('meta_'+f.name, new Blob([JSON.stringify(meta)], {type:'application/json'}), 'meta.json');
+   } else {
+     fd.append('files', f);
+   }
+  }
+ }catch(err){ alert('Ошибка шифрования: '+err); return; }
  prog.style.display='block';prog.value=0;
  const xhr=new XMLHttpRequest();xhr.open('POST','/upload');
  xhr.upload.onprogress=e=>{if(e.lengthComputable)prog.value=e.loaded/e.total*100};
@@ -37,5 +150,53 @@ async function upload(files){
  xhr.send(fd);
 }
 function delFile(url){fetch('/delete/'+url,{method:'POST'}).then(()=>location.reload())}
+
+// ---------- скачивание со сквозной расшифровкой ----------
+async function unwrapFileKey(meta){
+  const id = await getIdentity();
+  for(const r of meta.recipients){
+    try{
+      const eph = await importRawPub(r.pubkey);
+      const shared = await crypto.subtle.deriveBits({name:'ECDH', public:eph}, id, 256);
+      const kek = await deriveAes(shared, b64d(r.salt));
+      const keyBuf = await crypto.subtle.decrypt({name:'AES-GCM', iv:b64d(r.iv)}, kek, b64d(r.wrapped_key));
+      return crypto.subtle.importKey('raw', keyBuf, {name:'AES-GCM'}, false, ['decrypt']);
+    }catch(e){ /* этот получатель не наш — пробуем следующего */ }
+  }
+  throw new Error('не удалось извлечь ключ файла');
+}
+async function decryptDownload(url, a){
+  a.textContent='Расшифровка…';
+  const resp = await fetch(url);
+  if(!resp.ok) throw new Error('сервер ответил '+resp.status);
+  const data = new Uint8Array(await resp.arrayBuffer());
+  if(data.length<6 || MAGIC_WEB.some((b,i)=>data[i]!==b)) throw new Error('файл не зашифрован по схеме браузера');
+  const r = await fetch(url + '.ekey.json');
+  if(!r.ok) throw new Error('нет конверта ключей');
+  const meta = await r.json();
+  const aesKey = await unwrapFileKey(meta);
+  let iv = b64d(meta.iv); const out=[]; let pos=6;
+  while(pos < data.length){
+    const end=Math.min(pos+CHUNK+16, data.length); // чанк + GCM-тег
+    out.push(await crypto.subtle.decrypt({name:'AES-GCM', iv}, aesKey, data.slice(pos,end)));
+    iv=nextNonce(iv); pos=end;
+  }
+  const blob=new Blob(out,{type:meta.content_type||'application/octet-stream'});
+  const dl=document.createElement('a'); dl.href=URL.createObjectURL(blob); dl.download=meta.name;
+  document.body.appendChild(dl); dl.click(); dl.remove();
+}
+document.addEventListener('click', e=>{
+  const a = e.target.closest && e.target.closest('a.dl');
+  if(!a) return;
+  if(!(SECURE && window.crypto && crypto.subtle)) return; // без WebCrypto — обычное скачивание
+  e.preventDefault();
+  const url = a.getAttribute('href');
+  decryptDownload(url, a).catch(err=>{
+    a.textContent='Скачать';
+    if(confirm('Не удалось расшифровать в браузере: '+err.message+'\nСкачать как есть (зашифрованный)?')){
+      location.href = url;
+    }
+  });
+});
 </script>
 </body></html>
