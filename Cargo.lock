@@ -1302,7 +1302,6 @@ dependencies = [
  "dirs",
  "eframe",
  "futures-util",
- "http-body",
  "image",
  "local-ip-address",
  "open",
