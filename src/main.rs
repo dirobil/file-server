@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use axum::extract::{Multipart, Path as AxPath, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as AxPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -109,7 +109,13 @@ pub fn build_router(state: AppState) -> Router {
         // и проверяется потоково внутри хендлера upload(); предохранитель от
         // гигантских тел ставит middleware `body_limit` — он перечитывает конфиг
         // на каждый запрос, поэтому настройка применяется без перезапуска.
-        .route("/upload", axum::routing::post(upload))
+        // Важно: экстрактор Multipart по умолчанию обрезает тело запроса до 2 МБ
+        // (встроенный DefaultBodyLimit axum), поэтому для /upload явно снимаем
+        // этот лимит — реальный порог держат body_limit и потоковая проверка.
+        .route(
+            "/upload",
+            axum::routing::post(upload).layer(DefaultBodyLimit::disable()),
+        )
         .route("/download/{*name}", get(download))
         // Открытая зона входа — только если пароль уже установлен.
         .route("/login", get(login_page).post(login_submit))
@@ -220,7 +226,15 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(e) => {
-                errors.push(format!("Ошибка чтения данных: {e}"));
+                let msg = if format!("{e}").contains("length limit") {
+                    format!(
+                        "Файл превышает лимит {limit_label}. \
+                         Администратор может увеличить его в /admin."
+                    )
+                } else {
+                    format!("Ошибка чтения данных: {e}")
+                };
+                errors.push(msg);
                 break;
             }
         };
@@ -883,7 +897,7 @@ async fn body_limit(
     }
 
     let resp = next.run(req).await;
-    drain_unfinished_request(resp, declared.is_some()).await
+    drain_unfinished_request(resp, declared.is_some())
 }
 
 /// Ответ «запрос слишком большой» с человекочитаемым текстом (его покажет
