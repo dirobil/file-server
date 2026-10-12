@@ -63,7 +63,10 @@ async fn main() {
     }
 
     let templates = Templates::load();
+    // AppState — дешёвая ручка (Arc внутри), клонируем: один экземпляр уходит в
+    // .with_state(app), второй нужен после сборки роутера для проверки TLS-настроек.
     let state = AppState::new(templates, config_path.clone(), cfg.clone());
+    let app_state = state.clone();
 
     // Админ-зона (/admin, /logout) закрыта middleware require_admin:
     // пользователи без сессии видят страницу «нет доступа».
@@ -107,7 +110,7 @@ async fn main() {
 
     // HTTPS (нужен для WebCrypto на не-local адресе вроде 192.168.0.16).
     // Сертификат — самоподписанный, выпускается автоматически при первом включении.
-    let cfg_now = state.config();
+    let cfg_now = app_state.config();
     let https_task = if cfg_now.tls.enabled {
         let addr = cfg_now.tls.addr.clone();
         match tls::server_config(&addr) {
