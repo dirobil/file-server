@@ -846,17 +846,22 @@ fn sanitize_header(s: &str) -> String {
         .collect()
 }
 
-/// Обёртка над телом запроса, отсекающая поток, как только передано больше
-/// `cap` байт. Используется middleware `body_limit`: честный пофайловый лимит
-/// проверяется в `upload()`, а здесь — грубая защита от чрезмерно больших тел.
+/// Тело-обёртка, ограничивающее размер запроса сверху (`cap` байт).
+///
+/// Работает честно: если клиент объявил `Content-Length` больше лимита,
+/// тело сразу отдаёт ошибку — multipart-парсер не пытается разобрать заведомо
+/// обрезанный поток (в отличие от грубого усечения байтов на лету). Если же
+/// длина неизвестна (chunked), поток просто обрывается после `cap` байт.
 struct LimitedBody {
-    inner: Box<dyn http_body::Body<Data = axum::body::Bytes, Error = axum::Error> + Unpin + Send + Sync>,
-    remaining: usize,
+    inner: axum::body::Body,
+    cap: usize,
+    seen: usize,
+    done: bool,
 }
 
 impl LimitedBody {
     fn new(body: axum::body::Body, cap: usize) -> Self {
-        Self { inner: Box::pin(body), remaining: cap }
+        Self { inner: body, cap, seen: 0, done: false }
     }
 }
 
@@ -867,44 +872,54 @@ impl http_body::Body for LimitedBody {
     fn poll_frame(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<http_body::Frame<Self::Data>>, Self::Error>> {
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
         let this = self.get_mut();
-        if this.remaining == 0 {
-            return std::task::Poll::Ready(Ok(None));
+        if this.done {
+            return Poll::Ready(None);
         }
         match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
-            std::task::Poll::Ready(Ok(Some(http_body::Frame::Data(data)))) => {
-                let len = data.len();
-                if len >= this.remaining {
-                    let take = this.remaining.min(len);
-                    this.remaining = 0;
-                    std::task::Poll::Ready(Ok(Some(http_body::Frame::Data(data.slice(..take)))))
-                } else {
-                    this.remaining -= len;
-                    std::task::Poll::Ready(Ok(Some(http_body::Frame::Data(data))))
+            Poll::Ready(Some(Ok(frame))) => {
+                let data = match frame.into_data() {
+                    Ok(d) => d,
+                    Err(trailers) => return Poll::Ready(Some(Ok(trailers))),
+                };
+                this.seen += data.len();
+                if this.seen > this.cap {
+                    // Тело длиннее лимита: обрываем поток ошибкой вместо тихого усечения.
+                    this.done = true;
+                    return Poll::Ready(Some(Err(axum::Error::new("request body too large"))));
                 }
+                Poll::Ready(Some(Ok(http_body::Frame::data(data))))
             }
             other => other,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.remaining == 0 || self.inner.is_end_stream()
+        self.done || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         let inner = self.inner.size_hint();
-        let rem = self.remaining as u64;
-        match inner.upper() {
-            Some(u) => http_body::SizeHint::new(inner.lower().min(rem), u.min(rem)),
-            None => http_body::SizeHint::new(inner.lower(), rem),
+        // Если заявленная длина превышает лимит, upper = cap мгновенно сообщает
+        // экстрактору (Multipart/Form), что запрос заведомо слишком большой,
+        // и он отвечает ошибкой, не читая тело.
+        let mut hint = http_body::SizeHint::new();
+        hint.set_lower(inner.lower());
+        if let Some(u) = inner.upper() {
+            hint.set_upper(u);
         }
+        if hint.upper().is_none_or(|u| u > self.cap as u64) { hint.set_upper(self.cap as u64); }
+        hint
     }
 }
 
 /// Middleware-предохранитель: ограничивает размер тела запроса текущим
-/// `max_upload_mb` из конфига + запас на рамки multipart (иначе аксиомовский
-/// DefaultBodyLimit 2 МБ резал бы загрузку любых файлов больше 2 МБ).
+/// `max_upload_mb` из конфига + запас на рамки multipart. Axum по умолчанию
+/// ничего не лимитирует сам (для потоковых экстракторов вроде Multipart
+/// встроенный DefaultBodyLimit не применяется), поэтому весь контроль размера
+/// держится здесь и в потоковой проверке внутри хендлера upload().
 async fn body_limit(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -912,6 +927,9 @@ async fn body_limit(
 ) -> Response {
     let limit = state.config().max_upload_bytes();
     let cap = limit + limit / 8 + 1024 * 1024;
-    let limited = req.map_body(|_, body| axum::body::Body::new(LimitedBody::new(body, cap)));
+    // В http 1.x у Request нет map_body — пересобираем запрос вручную,
+    // подменяя тело ограниченным потоком LimitedBody.
+    let (parts, body) = req.into_parts();
+    let limited = axum::extract::Request::from_parts(parts, axum::body::Body::new(LimitedBody::new(body, cap)));
     next.run(limited).await
 }
