@@ -38,21 +38,31 @@ pub fn cert_path() -> PathBuf {
 /// Прочитать готовый сертификат с диска; `None` если файла нет или он битый.
 fn load_saved(path: &Path) -> Option<Arc<ServerConfig>> {
     let pem = std::fs::read(path).ok()?;
-    parse_pem(&pem).map(Arc::new)
+    // parse_pem возвращает Result — для «битого» файла это просто None, поэтому гасим ошибку.
+    parse_pem(&pem).map(Arc::new).ok()
 }
 
 /// Собрать rustls-конфиг из PEM-ов (секрета сертификата и самого сертификата).
 fn parse_pem(pem: &[u8]) -> Result<ServerConfig, String> {
     use std::io::BufReader;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let mut certs = rustls_pemfile::certs(&mut BufReader::new(pem));
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(pem));
+    // with_single_cert ждёт Vec<CertificateDer> — оборачиваем единственный сертификат в вектор.
+    let cert: CertificateDer = certs
+        .next()
+        .and_then(|r| r.ok())
+        .ok_or("в PEM не найден сертификат")?;
+    // pkcs8_private_keys отдаёт PrivatePkcs8KeyDer — приводим к enum PrivateKeyDer.
+    let key: PrivateKeyDer = keys
+        .next()
+        .and_then(|r| r.ok())
+        .map(PrivateKeyDer::Pkcs8)
+        .ok_or("в PEM не найден PKCS#8 ключ")?;
     // rustls 0.23 требует явного ALPN: отдаём h2 и http/1.1 (hyper поддержит оба).
     let cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            certs.next().and_then(|r| r.ok()).map(Vec::from).unwrap_or_default(),
-            keys.next().and_then(|r| r.ok())?,
-        )
+        .with_single_cert(vec![cert], key)
         .map_err(|e| format!("не удалось настроить TLS: {e}"))?;
     Ok(cfg)
 }

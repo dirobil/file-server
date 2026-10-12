@@ -306,6 +306,11 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
     let mut saved: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
+    // Буфер «заглянуть без изъятия»: axum 0.8 не даёт читать поле произвольным
+    // чанком с возвратом байтов, поэтому первые прочитанные байты храним здесь
+    // и дописываем в файл вручную перед основным циклом чтения.
+    let mut pending: Vec<u8> = Vec::new();
+
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
@@ -326,11 +331,17 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             .map(|c| c.to_string())
             .unwrap_or_else(|| "application/octet-stream".to_string());
         // Файл зашифрован в браузере (WebCrypto)? Магическая сигнатура FSweb1.
-        let mut peek = [0u8; 6];
-        let is_web_enc = match field.fill_bytes(&mut peek).await {
-            Ok(()) => peek == *crypto::MAGIC_WEB,
-            Err(_) => false,
+        // Читаем первый чанк и проверяем префикс; остаток чанка остаётся в `pending`.
+        let first_chunk = match field.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => Default::default(),
+            Err(e) => {
+                errors.push(format!("Ошибка загрузки {name}: {e}"));
+                continue;
+            }
         };
+        let is_web_enc = first_chunk.starts_with(crypto::MAGIC_WEB.as_slice());
+        pending.extend_from_slice(&first_chunk);
 
         if is_web_enc {
             // Сквозное шифрование: сервер хранит только шифртекст + конверт параметров.
@@ -347,16 +358,19 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
                 Ok(f) => f,
                 Err(e) => {
                     errors.push(format!("Не удалось создать файл {name}: {e}"));
+                    pending.clear();
                     continue;
                 }
             };
             let mut written: usize = 0;
             let mut failed = false;
             use tokio::io::AsyncWriteExt;
-            // первые 6 байт уже прочитаны в peek
-            if out.write_all(&peek).await.is_err() {
+            // первые прочитанные байты (магическая сигнатура + остаток первого чанка)
+            if out.write_all(&pending).await.is_err() {
                 failed = true;
             }
+            written += pending.len();
+            pending.clear();
             while !failed {
                 match field.chunk().await {
                     Ok(Some(chunk)) => {
@@ -417,12 +431,14 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
         let _ = rand::rngs::OsRng.try_fill_bytes(&mut nonce_base);
         let mut seq: u32 = 0;
         let mut plain_size: u64 = 0;
+        let mut written: usize = 0;
 
         // stream the field to disk in chunks to avoid loading whole file into memory
         let mut data = match fs::File::create(&path).await {
             Ok(f) => f,
             Err(e) => {
                 errors.push(format!("Не удалось создать файл {name}: {e}"));
+                pending.clear();
                 continue;
             }
         };
@@ -434,17 +450,61 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
                 drop(data);
                 let _ = fs::remove_file(&path).await;
                 errors.push(format!("Ошибка записи заголовка {name}: {e}"));
+                pending.clear();
                 continue;
             }
             if let Err(e) = data.write_all(&nonce_base).await {
                 drop(data);
                 let _ = fs::remove_file(&path).await;
                 errors.push(format!("Ошибка записи заголовка {name}: {e}"));
+                pending.clear();
                 continue;
             }
         }
 
-        let mut written: usize = 0;
+        // Сначала выписываем «подсмотренный» первый чанк, затем читаем остальные.
+        {
+            use tokio::io::AsyncWriteExt;
+            let head = std::mem::take(&mut pending);
+            if !head.is_empty() {
+                plain_size += head.len() as u64;
+                let out_buf: Vec<u8> = match &enc_key {
+                    Some(key) => match crypto::encrypt_chunk(key, &nonce_base, seq, &head) {
+                        Ok(enc) => {
+                            seq += 1;
+                            let mut buf = Vec::with_capacity(4 + enc.len());
+                            buf.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(&enc);
+                            buf
+                        }
+                        Err(e) => {
+                            errors.push(format!("Ошибка шифрования {name}: {e}"));
+                            drop(data);
+                            let _ = fs::remove_file(&path).await;
+                            continue;
+                        }
+                    },
+                    None => head.to_vec(),
+                };
+                written += head.len();
+                if written > MAX_FILE_SIZE {
+                    drop(data);
+                    let _ = fs::remove_file(&path).await;
+                    errors.push(format!(
+                        "Файл {name} превышает лимит {} МБ",
+                        MAX_FILE_SIZE / 1024 / 1024
+                    ));
+                    continue;
+                }
+                if let Err(e) = data.write_all(&out_buf).await {
+                    drop(data);
+                    let _ = fs::remove_file(&path).await;
+                    errors.push(format!("Ошибка записи {name}: {e}"));
+                    continue;
+                }
+            }
+        }
+
         let mut failed = false;
         loop {
             match field.chunk().await {
@@ -841,21 +901,21 @@ struct LoginForm {
 
 async fn admin_page(State(state): State<AppState>, query: axum::extract::Query<AdminQuery>) -> Response {
     let current = state.storage_dir().map(|d| d.display().to_string());
-    let message = match query.msg.as_deref() {
-        Some("saved") => Some("Настройка сохранена: обмен файлами работает."),
-        Some("cleared") => Some("Настройка сброшена: пользователи снова видят заглушку."),
-        Some("password") => Some("Пароль администратора обновлён."),
-        Some("enc_on") => Some("Шифрование включено: новые файлы будут зашифрованы (AES-256-GCM)."),
-        Some("enc_off") => Some("Шифрование выключено: новые файлы сохраняются как есть."),
-        Some("tls_on") => Some("HTTPS включён. Откройте https://адрес:порт и примите сертификат один раз — после этого доступен тумблер «Шифрование в браузере»."),
-        Some("tls_off") => Some("HTTPS выключен."),
-        Some("tls_addr") => Some("Адрес для сертификата обновлён. При следующем перезапуске будет выпущен новый сертификат."),
-        Some(e) if e.starts_with("tls_err:") => Some(&format!("Не удалось включить HTTPS: {}", &e["tls_err:".len()..])),
+    // Сообщение приводим к String: ветка с tls_err строится через format! и не живёт
+    // достаточно долго как &str (E0308), а дальше оно всё равно копируется в шаблон.
+    let message: Option<String> = match query.msg.as_deref() {
+        Some("saved") => Some("Настройка сохранена: обмен файлами работает.".to_string()),
+        Some("cleared") => Some("Настройка сброшена: пользователи снова видят заглушку.".to_string()),
+        Some("password") => Some("Пароль администратора обновлён.".to_string()),
+        Some("enc_on") => Some("Шифрование включено: новые файлы будут зашифрованы (AES-256-GCM).".to_string()),
+        Some("enc_off") => Some("Шифрование выключено: новые файлы сохраняются как есть.".to_string()),
+        Some("tls_on") => Some("HTTPS включён. Откройте https://адрес:порт и примите сертификат один раз — после этого доступен тумблер «Шифрование в браузере».".to_string()),
+        Some("tls_off") => Some("HTTPS выключен.".to_string()),
+        Some("tls_addr") => Some("Адрес для сертификата обновлён. При следующем перезапуске будет выпущен новый сертификат.".to_string()),
+        Some(e) if e.starts_with("tls_err:") => Some(format!("Не удалось включить HTTPS: {}", &e["tls_err:".len()..])),
         _ => None,
     };
-    // сообщение может быть сформировано локально — копируем до заимствования
-    let message_owned = message.map(|s| s.to_string());
-    render_admin(&state, current.as_deref(), message_owned.as_deref(), None)
+    render_admin(&state, current.as_deref(), message.as_deref(), None)
 }
 
 async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>) -> Response {

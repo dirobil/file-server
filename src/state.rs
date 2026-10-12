@@ -199,7 +199,7 @@ impl AppState {
             *guard = Some(p256::SecretKey::random(&mut rand_core::OsRng));
         }
         let sk = guard.as_ref().unwrap();
-        let pk = sk.public();
+        let pk = sk.public_key();
         crate::crypto::b64url_encode(pk.to_encoded_point(false).as_bytes())
     }
 
