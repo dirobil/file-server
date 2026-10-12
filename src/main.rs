@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use axum::extract::{Multipart, Path as AxPath, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Multipart, Path as AxPath, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -846,90 +846,74 @@ fn sanitize_header(s: &str) -> String {
         .collect()
 }
 
-/// Тело-обёртка, ограничивающее размер запроса сверху (`cap` байт).
-///
-/// Работает честно: если клиент объявил `Content-Length` больше лимита,
-/// тело сразу отдаёт ошибку — multipart-парсер не пытается разобрать заведомо
-/// обрезанный поток (в отличие от грубого усечения байтов на лету). Если же
-/// длина неизвестна (chunked), поток просто обрывается после `cap` байт.
-struct LimitedBody {
-    inner: axum::body::Body,
-    cap: usize,
-    seen: usize,
-    done: bool,
-}
-
-impl LimitedBody {
-    fn new(body: axum::body::Body, cap: usize) -> Self {
-        Self { inner: body, cap, seen: 0, done: false }
-    }
-}
-
-impl http_body::Body for LimitedBody {
-    type Data = axum::body::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        use std::task::Poll;
-        let this = self.get_mut();
-        if this.done {
-            return Poll::Ready(None);
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                let data = match frame.into_data() {
-                    Ok(d) => d,
-                    Err(trailers) => return Poll::Ready(Some(Ok(trailers))),
-                };
-                this.seen += data.len();
-                if this.seen > this.cap {
-                    // Тело длиннее лимита: обрываем поток ошибкой вместо тихого усечения.
-                    this.done = true;
-                    return Poll::Ready(Some(Err(axum::Error::new("request body too large"))));
-                }
-                Poll::Ready(Some(Ok(http_body::Frame::data(data))))
-            }
-            other => other,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.done || self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        let inner = self.inner.size_hint();
-        // Если заявленная длина превышает лимит, upper = cap мгновенно сообщает
-        // экстрактору (Multipart/Form), что запрос заведомо слишком большой,
-        // и он отвечает ошибкой, не читая тело.
-        let mut hint = http_body::SizeHint::new();
-        hint.set_lower(inner.lower());
-        if let Some(u) = inner.upper() {
-            hint.set_upper(u);
-        }
-        if hint.upper().is_none_or(|u| u > self.cap as u64) { hint.set_upper(self.cap as u64); }
-        hint
-    }
-}
-
 /// Middleware-предохранитель: ограничивает размер тела запроса текущим
 /// `max_upload_mb` из конфига + запас на рамки multipart. Axum по умолчанию
 /// ничего не лимитирует сам (для потоковых экстракторов вроде Multipart
 /// встроенный DefaultBodyLimit не применяется), поэтому весь контроль размера
 /// держится здесь и в потоковой проверке внутри хендлера upload().
+///
+/// Схема работы (без перечитывания тела и без ложных срабатываний):
+///  - если клиент объявил `Content-Length` больше лимита — сразу отвечаем
+///    «413» с понятным сообщением, не читая тело;
+///  - иначе тело передаётся дальше как есть, а реальный порог по фактическим
+///    байтам обеспечивает потоковая проверка в `upload()`;
+///  - если во время разбора multipart поток оборвался ошибкой (например,
+///    клиент закрыл соединение), гипер-соединение корректно завершается,
+///    а не «зависает» без ответа.
 async fn body_limit(
     State(state): State<AppState>,
-    req: axum::extract::Request,
+    req: Request,
     next: middleware::Next,
 ) -> Response {
     let limit = state.config().max_upload_bytes();
+    // Запас на служебные части multipart (границы, заголовки частей) и на то,
+    // что файл может быть ровно `limit` байт.
     let cap = limit + limit / 8 + 1024 * 1024;
-    // В http 1.x у Request нет map_body — пересобираем запрос вручную,
-    // подменяя тело ограниченным потоком LimitedBody.
-    let (parts, body) = req.into_parts();
-    let limited = axum::extract::Request::from_parts(parts, axum::body::Body::new(LimitedBody::new(body, cap)));
-    next.run(limited).await
+
+    // Быстрая проверка по заявленной длине (если она известна).
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(len) = declared {
+        if len > cap as u64 {
+            return too_large_response(limit);
+        }
+    }
+
+    let resp = next.run(req).await;
+    drain_unfinished_request(resp, declared.is_some()).await
+}
+
+/// Ответ «запрос слишком большой» с человекочитаемым текстом (его покажет
+/// страница загрузки при ajax-ошибке вместо бессмысленного «Ошибка загрузки»).
+fn too_large_response(limit: usize) -> Response {
+    let label = templates::human_size(limit as u64);
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "Файл слишком большой: превышен лимит {label}. \
+             Администратор может увеличить его в /admin."
+        ),
+    )
+        .into_response()
+}
+
+/// Если хендлер вернул ошибку 400 (например, multipart-экстрактор отказал,
+/// не начав читать тело), а клиент объявил `Content-Length`, hyper не может
+/// корректно завершить соединение с незавершённым телом: браузер не получает
+/// ответ, и на странице «ничего не происходит». В этом случае возвращаем
+/// ответ с заголовком `Connection: close` — гипер допишет ответ и корректно
+/// закроет соединение, xhr увидит сетевую ошибку и покажет понятное сообщение.
+fn drain_unfinished_request(resp: Response, req_had_known_length: bool) -> Response {
+    if !(req_had_known_length && resp.status() == StatusCode::BAD_REQUEST) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    parts.headers.insert(
+        header::CONNECTION,
+        HeaderValue::from_static("close"),
+    );
+    axum::response::Response::from_parts(parts, body).into_response()
 }
