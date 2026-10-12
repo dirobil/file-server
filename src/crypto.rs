@@ -248,8 +248,11 @@ mod tests {
     fn ecdh_public_validation() {
         use p256::elliptic_curve::sec1::ToEncodedPoint;
         use p256::{PublicKey, SecretKey};
-        let sk = SecretKey::random(&mut rand::rngs::OsRng);
-        let pk = PublicKey::from(sk.as_affine());
+        // rand 0.9 использует rand_core 0.9, а elliptic-curve/p256 ожидает
+        // rand_core 0.6 — берём OsRng именно из него (см. Cargo.toml).
+        let sk = SecretKey::random(&mut rand_core::OsRng);
+        // Метод называется public_key (не as_affine).
+        let pk: PublicKey = sk.public_key();
         let sec1 = pk.to_encoded_point(false).as_bytes().to_vec();
         assert_eq!(sec1.len(), 65);
         assert_eq!(validate_ecdh_public(&sec1).unwrap(), sec1);

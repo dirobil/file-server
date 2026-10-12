@@ -46,8 +46,15 @@ fn load_saved(path: &Path) -> Option<Arc<ServerConfig>> {
 fn parse_pem(pem: &[u8]) -> Result<ServerConfig, String> {
     use std::io::BufReader;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let mut certs = rustls_pemfile::certs(&mut BufReader::new(pem));
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(pem));
+    // В графе зависимостей оказались два крипто-провайдера rustls (ring — у нас
+    // в Cargo.toml, aws-lc-rs — транзитивно), поэтому автоопределение не работает.
+    // Явно выбираем ring; install_default идемпотентен (ошибку гасим).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    // BufReader'ы живут до конца функции: итераторы ссылаются на них (E0716).
+    let mut cert_reader = BufReader::new(pem);
+    let mut key_reader = BufReader::new(pem);
+    let mut certs = rustls_pemfile::certs(&mut cert_reader);
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
     // with_single_cert ждёт Vec<CertificateDer> — оборачиваем единственный сертификат в вектор.
     let cert: CertificateDer = certs
         .next()
