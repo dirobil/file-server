@@ -12,6 +12,7 @@ use tokio::fs;
 mod auth;
 mod config;
 mod crypto;
+mod gui;
 mod state;
 mod templates;
 
@@ -22,6 +23,14 @@ const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100 MB per file
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Флаг --gui (или FILE_SERVER_GUI=1): запускаем нативное окно с адресом и QR-кодом.
+    if args.iter().any(|a| a == "--gui") || std::env::var("FILE_SERVER_GUI").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        gui::run_from_cli(&args);
+        return;
+    }
+
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
     // Конфиг лежит в «домашней директории приложения» (Windows/Linux/Mac — свои пути),
@@ -64,28 +73,7 @@ async fn main() {
     let templates = Templates::load();
     let state = AppState::new(templates, config_path.clone(), cfg.clone());
 
-    // Админ-зона (/admin, /logout) закрыта middleware require_admin:
-    // пользователи без сессии видят страницу «нет доступа».
-    let admin_zone = Router::new()
-        .route("/admin", get(admin_page).post(admin_submit))
-        .route("/logout", get(logout))
-        // Удаление файлов — тоже админская операция: пользователи могут только
-        // загружать и скачивать, но не стирать чужие файлы.
-        .route("/delete/{*name}", axum::routing::post(delete_file))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
-
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/upload", axum::routing::post(upload))
-        .route("/download/{*name}", get(download))
-        // Открытая зона входа — только если пароль уже установлен.
-        .route("/login", get(login_page).post(login_submit))
-        .merge(admin_zone)
-        // CSS is embedded into the binary too, so the server needs no files at runtime.
-        .route("/style.css", get(|| async {
-            ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], templates::STYLE_CSS)
-        }))
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,
@@ -103,6 +91,32 @@ async fn main() {
         eprintln!("Ошибка сервера: {e}");
         std::process::exit(1);
     }
+}
+
+/// Собирает HTTP-роутер сервера. Используется и консольным `main`, и GUI-окном.
+pub fn build_router(state: AppState) -> Router {
+    // Админ-зона (/admin, /logout) закрыта middleware require_admin:
+    // пользователи без сессии видят страницу «нет доступа».
+    let admin_zone = Router::new()
+        .route("/admin", get(admin_page).post(admin_submit))
+        .route("/logout", get(logout))
+        // Удаление файлов — тоже админская операция: пользователи могут только
+        // загружать и скачивать, но не стирать чужие файлы.
+        .route("/delete/{*name}", axum::routing::post(delete_file))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
+
+    Router::new()
+        .route("/", get(index))
+        .route("/upload", axum::routing::post(upload))
+        .route("/download/{*name}", get(download))
+        // Открытая зона входа — только если пароль уже установлен.
+        .route("/login", get(login_page).post(login_submit))
+        .merge(admin_zone)
+        // CSS is embedded into the binary too, so the server needs no files at runtime.
+        .route("/style.css", get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], templates::STYLE_CSS)
+        }))
+        .with_state(state)
 }
 
 /// Main page. If the server is not configured yet — show the "not configured" stub.
