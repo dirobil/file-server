@@ -108,6 +108,17 @@ impl AppState {
         cfg.save(&self.config_path)
     }
 
+    /// Изменить максимальный размер загружаемого файла (в МБ) и сохранить конфиг.
+    pub fn set_max_upload_mb(&self, mb: u64) -> Result<(), String> {
+        let cfg = {
+            let mut cur = self.config.write().expect("config lock poisoned");
+            cur.version = crate::config::CONFIG_VERSION;
+            cur.max_upload_mb = mb;
+            cur.clone()
+        };
+        cfg.save(&self.config_path)
+    }
+
     /// Текущий рабочий ключ шифрования (`None` — шифрование выключено).
     pub fn encryption_key(&self) -> Option<[u8; 32]> {
         self.config.read().expect("config lock poisoned").encryption_key()

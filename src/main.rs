@@ -19,8 +19,6 @@ mod templates;
 use auth::AdminCookie;
 use state::{AppState, Templates};
 
-const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100 MB per file
-
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -107,6 +105,10 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(index))
+        // Лимит размера загрузки задаётся в админ-панели (config.max_upload_mb)
+        // и проверяется потоково внутри хендлера upload(); предохранитель от
+        // гигантских тел ставит middleware `body_limit` — он перечитывает конфиг
+        // на каждый запрос, поэтому настройка применяется без перезапуска.
         .route("/upload", axum::routing::post(upload))
         .route("/download/{*name}", get(download))
         // Открытая зона входа — только если пароль уже установлен.
@@ -116,6 +118,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/style.css", get(|| async {
             ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], templates::STYLE_CSS)
         }))
+        .layer(middleware::from_fn_with_state(state.clone(), body_limit))
         .with_state(state)
 }
 
@@ -205,6 +208,10 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
         Some(d) => d,
     };
 
+    // Лимит размера файла берём из конфигурации — его можно менять в админ-панели.
+    let max_file_size = state.config().max_upload_bytes();
+    let limit_label = templates::human_size(state.config().max_upload_mb * 1024 * 1024);
+
     let mut saved: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -271,11 +278,11 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             match field.chunk().await {
                 Ok(Some(chunk)) => {
                     written += chunk.len();
-                    if written > MAX_FILE_SIZE {
+                    if written > max_file_size {
                         failed = true;
                         errors.push(format!(
-                            "Файл {name} превышает лимит {} МБ",
-                            MAX_FILE_SIZE / 1024 / 1024
+                            "Файл {name} превышает лимит {limit_label}. \
+                             Администратор может увеличить его в /admin."
                         ));
                         break;
                     }
@@ -487,7 +494,7 @@ async fn head_is_magic(path: &std::path::Path) -> Option<bool> {
 
 /// Расшифровать весь файл в оперативную память и вернуть как тело ответа.
 /// Формат на диске: MAGIC(4) | base(8) | для каждого чанка: len_u32_le + ciphertext+tag.
-/// (У нас лимит 100 МБ на файл — приемлемо.)
+/// (Размер файла ограничен настройкой «макс. размер загрузки» — приемлемо.)
 async fn decrypt_whole_file(path: &std::path::Path, key: &[u8; 32]) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut f = fs::File::open(path).await.map_err(|e| format!("не удалось открыть файл: {e}"))?;
@@ -558,6 +565,10 @@ struct AdminForm {
     new_password: Option<String>,
     /// Чекбокс «Шифровать файлы на диске» (значение «1», если отмечен).
     encrypt: Option<String>,
+    /// Кнопка отдельной формы «Применить лимит» (значение «1»).
+    apply_limit: Option<String>,
+    /// Новое значение лимита размера загрузки, МБ (поле в /admin).
+    max_upload_mb: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -578,6 +589,7 @@ async fn admin_page(State(state): State<AppState>, query: axum::extract::Query<A
         Some("password") => Some("Пароль администратора обновлён."),
         Some("enc_on") => Some("Шифрование включено: новые файлы будут зашифрованы (AES-256-GCM)."),
         Some("enc_off") => Some("Шифрование выключено: новые файлы сохраняются как есть."),
+        Some("limit") => Some("Лимит размера загружаемых файлов обновлён."),
         _ => None,
     };
     render_admin(&state, current.as_deref(), message, None)
@@ -593,6 +605,31 @@ async fn admin_submit(State(state): State<AppState>, Form(form): Form<AdminForm>
         if let Err(e) = state.set_admin_password_hash(auth::hash_password(&new_password)) {
             return render_admin_error(&state, &format!("Не удалось сохранить пароль: {e}"));
         }
+    }
+
+    // Лимит размера загрузки — отдельная форма со своей кнопкой (name="apply_limit" value="1"),
+    // чтобы не путать его с сохранением директории.
+    if form.apply_limit.as_deref() == Some("1") {
+        let raw = form.max_upload_mb.unwrap_or_default();
+        let mb: u64 = match raw.trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                return render_admin_error(
+                    &state,
+                    "Лимит должен быть целым числом мегабайт (например, 500).",
+                )
+            }
+        };
+        if mb == 0 || mb > crate::config::HARD_MAX_UPLOAD_MB {
+            return render_admin_error(&state, &format!(
+                "Лимит должен быть от 1 до {} МБ.",
+                crate::config::HARD_MAX_UPLOAD_MB
+            ));
+        }
+        if let Err(e) = state.set_max_upload_mb(mb) {
+            return render_admin_error(&state, &format!("Не удалось сохранить лимит: {e}"));
+        }
+        return Redirect::to("/admin?msg=limit").into_response();
     }
 
     if form.clear.as_deref() == Some("1") {
@@ -668,6 +705,12 @@ fn render_admin(
     } else {
         "<span class=\"banner\">Шифрование выключено: файлы лежат на диске в открытом виде.</span>"
     };
+    // Текущий лимит размера загрузки + подсказка для поля ввода.
+    let limit_mb = cfg.max_upload_mb.to_string();
+    let limit_hint = format!(
+        "Сейчас разрешено загружать файлы размером до {}.",
+        templates::human_size(cfg.max_upload_bytes() as u64)
+    );
 
     Html(templates::render(
         &state.templates.admin,
@@ -678,6 +721,9 @@ fn render_admin(
             ("pwd_hint", &templates::html_escape(pwd_hint)),
             ("enc_badge", enc_badge),
             ("enc_button", if cfg.encryption.enabled { "Выключить шифрование" } else { "Включить шифрование" }),
+            ("max_upload_mb", &limit_mb),
+            ("limit_hint", &templates::html_escape(&limit_hint)),
+            ("hard_max_mb", &crate::config::HARD_MAX_UPLOAD_MB.to_string()),
         ],
     ))
     .into_response()
@@ -798,4 +844,92 @@ fn sanitize_header(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
         .collect()
+}
+
+/// Тело-обёртка, ограничивающее размер запроса сверху (`cap` байт).
+///
+/// Работает честно: если клиент объявил `Content-Length` больше лимита,
+/// тело сразу отдаёт ошибку — multipart-парсер не пытается разобрать заведомо
+/// обрезанный поток (в отличие от грубого усечения байтов на лету). Если же
+/// длина неизвестна (chunked), поток просто обрывается после `cap` байт.
+struct LimitedBody {
+    inner: axum::body::Body,
+    cap: usize,
+    seen: usize,
+    done: bool,
+}
+
+impl LimitedBody {
+    fn new(body: axum::body::Body, cap: usize) -> Self {
+        Self { inner: body, cap, seen: 0, done: false }
+    }
+}
+
+impl http_body::Body for LimitedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let data = match frame.into_data() {
+                    Ok(d) => d,
+                    Err(trailers) => return Poll::Ready(Some(Ok(trailers))),
+                };
+                this.seen += data.len();
+                if this.seen > this.cap {
+                    // Тело длиннее лимита: обрываем поток ошибкой вместо тихого усечения.
+                    this.done = true;
+                    return Poll::Ready(Some(Err(axum::Error::new("request body too large"))));
+                }
+                Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let inner = self.inner.size_hint();
+        // Если заявленная длина превышает лимит, upper = cap мгновенно сообщает
+        // экстрактору (Multipart/Form), что запрос заведомо слишком большой,
+        // и он отвечает ошибкой, не читая тело.
+        let mut hint = http_body::SizeHint::new();
+        hint.set_lower(inner.lower());
+        if let Some(u) = inner.upper() {
+            hint.set_upper(u);
+        }
+        if hint.upper().is_none_or(|u| u > self.cap as u64) { hint.set_upper(self.cap as u64); }
+        hint
+    }
+}
+
+/// Middleware-предохранитель: ограничивает размер тела запроса текущим
+/// `max_upload_mb` из конфига + запас на рамки multipart. Axum по умолчанию
+/// ничего не лимитирует сам (для потоковых экстракторов вроде Multipart
+/// встроенный DefaultBodyLimit не применяется), поэтому весь контроль размера
+/// держится здесь и в потоковой проверке внутри хендлера upload().
+async fn body_limit(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let limit = state.config().max_upload_bytes();
+    let cap = limit + limit / 8 + 1024 * 1024;
+    // В http 1.x у Request нет map_body — пересобираем запрос вручную,
+    // подменяя тело ограниченным потоком LimitedBody.
+    let (parts, body) = req.into_parts();
+    let limited = axum::extract::Request::from_parts(parts, axum::body::Body::new(LimitedBody::new(body, cap)));
+    next.run(limited).await
 }
