@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use axum::extract::{Multipart, Path as AxPath, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as AxPath, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -76,7 +76,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/upload", axum::routing::post(upload))
+        .route("/upload", axum::routing::post(upload).layer(DefaultBodyLimit::disable()))
         .route("/download/{*name}", get(download))
         // Открытая зона входа — только если пароль уже установлен.
         .route("/login", get(login_page).post(login_submit))
