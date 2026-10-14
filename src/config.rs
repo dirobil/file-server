@@ -38,8 +38,12 @@ pub struct EncryptionConfig {
     pub key_hex: String,
 }
 
+/// Значение по умолчанию и верхняя граница лимита размера загружаемого файла (в МБ).
+pub const DEFAULT_MAX_UPLOAD_MB: u64 = 100;
+pub const HARD_MAX_UPLOAD_MB: u64 = 10_240; // 10 ГБ — разумный потолок настройки
+
 /// Полная конфигурация сервера.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
@@ -47,6 +51,21 @@ pub struct Config {
     pub storage_dir: Option<PathBuf>,
     pub admin: AdminConfig,
     pub encryption: EncryptionConfig,
+    /// Максимальный размер одного загружаемого файла, в мегабайтах.
+    /// Настраивается через админ-панель; по умолчанию 100 МБ.
+    pub max_upload_mb: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            storage_dir: None,
+            admin: AdminConfig::default(),
+            encryption: EncryptionConfig::default(),
+            max_upload_mb: DEFAULT_MAX_UPLOAD_MB,
+        }
+    }
 }
 
 impl Config {
@@ -55,9 +74,14 @@ impl Config {
         Self {
             version: CONFIG_VERSION,
             storage_dir,
-            admin: AdminConfig::default(),
-            encryption: EncryptionConfig::default(),
+            ..Default::default()
         }
+    }
+
+    /// Лимит размера загружаемого файла в байтах (с запасом на служебные поля
+    /// multipart-потока и шифрование — реальный порог проверки чуть выше).
+    pub fn max_upload_bytes(&self) -> usize {
+        self.max_upload_mb.saturating_mul(1024 * 1024) as usize
     }
 
     /// Рабочий 32-байтный ключ, если включён и корректный hex задан.
@@ -156,6 +180,8 @@ fn render_toml(cfg: &Config) -> Result<String, String> {
     } else {
         out.push_str(&format!("key_hex = {}\n", quoted(&cfg.encryption.key_hex)));
     }
+    out.push_str("\n# Максимальный размер одного загружаемого файла, МБ (настраивается в /admin)\n");
+    out.push_str(&format!("max_upload_mb = {}\n", cfg.max_upload_mb));
     Ok(out)
 }
 

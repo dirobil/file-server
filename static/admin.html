@@ -18,6 +18,17 @@
 <button class="secondary" type="submit" name="clear" value="1">Сбросить настройку</button>
 </form>
 <div class="card" style="margin-top:16px">
+<h1 style="font-size:18px">Максимальный размер загружаемого файла</h1>
+<p>{{limit_hint}}</p>
+<form method="post" action="/admin" style="margin-top:10px">
+<input class="dir" type="number" name="max_upload_mb" min="1" max="{{hard_max_mb}}" step="1" value="{{max_upload_mb}}" style="width:140px;display:inline-block"> <span class="sub">МБ (от 1 до {{hard_max_mb}})</span>
+<br>
+<button class="secondary" type="submit" name="apply_limit" value="1" style="margin-top:10px">Применить лимит</button>
+<input type="hidden" name="directory" value="{{current}}">
+</form>
+<p class="sub">Лимит сохраняется в конфиг-файл и действует сразу — без перезапуска сервера. Если файл больше лимита, пользователь получит понятную ошибку при загрузке.</p>
+</div>
+<div class="card" style="margin-top:16px">
 <h1 style="font-size:18px">Шифрование файлов на диске</h1>
 <p>{{enc_badge}}</p>
 <form method="post" action="/admin" style="margin-top:10px">
