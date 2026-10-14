@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use axum::extract::{Multipart, Path as AxPath, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as AxPath, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -109,7 +109,13 @@ pub fn build_router(state: AppState) -> Router {
         // и проверяется потоково внутри хендлера upload(); предохранитель от
         // гигантских тел ставит middleware `body_limit` — он перечитывает конфиг
         // на каждый запрос, поэтому настройка применяется без перезапуска.
-        .route("/upload", axum::routing::post(upload))
+        // Важно: экстрактор Multipart по умолчанию обрезает тело запроса до 2 МБ
+        // (встроенный DefaultBodyLimit axum), поэтому для /upload явно снимаем
+        // этот лимит — реальный порог держат body_limit и потоковая проверка.
+        .route(
+            "/upload",
+            axum::routing::post(upload).layer(DefaultBodyLimit::disable()),
+        )
         .route("/download/{*name}", get(download))
         // Открытая зона входа — только если пароль уже установлен.
         .route("/login", get(login_page).post(login_submit))
@@ -220,7 +226,15 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(e) => {
-                errors.push(format!("Ошибка чтения данных: {e}"));
+                let msg = if format!("{e}").contains("length limit") {
+                    format!(
+                        "Файл превышает лимит {limit_label}. \
+                         Администратор может увеличить его в /admin."
+                    )
+                } else {
+                    format!("Ошибка чтения данных: {e}")
+                };
+                errors.push(msg);
                 break;
             }
         };
@@ -373,11 +387,14 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
         } else {
             "Ни один файл не был загружен"
         };
-        (
-            StatusCode::BAD_REQUEST,
-            format!("{msg}: {}", errors.join("; ")),
-        )
-            .into_response()
+        // Если все файлы отклонены из-за размера — отвечаем корректным 413,
+        // чтобы страница загрузки показала точный текст лимита.
+        let status = if errors.iter().all(|e| e.contains("превышает лимит")) {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, format!("{msg}: {}", errors.join("; "))).into_response()
     }
 }
 
@@ -846,86 +863,74 @@ fn sanitize_header(s: &str) -> String {
         .collect()
 }
 
-/// Обёртка над телом запроса, отсекающая поток, как только передано больше
-/// `cap` байт. Используется middleware `body_limit`: честный пофайловый лимит
-/// проверяется в `upload()`, а здесь — грубая защита от чрезмерно больших тел.
-struct LimitedBody {
-    inner: axum::body::Body,
-    remaining: usize,
-}
-
-impl LimitedBody {
-    fn new(body: axum::body::Body, cap: usize) -> Self {
-        Self { inner: body, remaining: cap }
-    }
-}
-
-impl http_body::Body for LimitedBody {
-    type Data = axum::body::Bytes;
-    type Error = axum::Error;
-
-    // В http-body 1.x `poll_frame` возвращает `Poll<Option<Result<Frame>>>`
-    // (ошибка «снаружи», а не внутри `Result`), а кадры конструируются через
-    // `Frame::data(..)` / `Frame::trailers(..)` — вариантов-конструкторов нет.
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        if this.remaining == 0 {
-            return std::task::Poll::Ready(None);
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
-            std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    let len = data.len();
-                    if len >= this.remaining {
-                        let take = this.remaining.min(len);
-                        this.remaining = 0;
-                        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
-                            data.slice(..take),
-                        ))))
-                    } else {
-                        this.remaining -= len;
-                        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
-                    }
-                }
-                // Trailers и прочие немые кадры пропускаем как есть.
-                Err(other) => std::task::Poll::Ready(Some(Ok(other))),
-            },
-            other => other,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.remaining == 0 || self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        // SizeHint в 1.x собирается сеттерами `set_lower` / `set_upper`.
-        let inner = self.inner.size_hint();
-        let rem = self.remaining as u64;
-        let mut hint = http_body::SizeHint::new();
-        hint.set_lower(inner.lower().min(rem));
-        match inner.upper() {
-            Some(u) => hint.set_upper(u.min(rem)),
-            None => hint.set_upper(rem),
-        }
-        hint
-    }
-}
-
 /// Middleware-предохранитель: ограничивает размер тела запроса текущим
-/// `max_upload_mb` из конфига + запас на рамки multipart (иначе аксиомовский
-/// DefaultBodyLimit 2 МБ резал бы загрузку любых файлов больше 2 МБ).
+/// `max_upload_mb` из конфига + запас на рамки multipart. Axum по умолчанию
+/// ничего не лимитирует сам (для потоковых экстракторов вроде Multipart
+/// встроенный DefaultBodyLimit не применяется), поэтому весь контроль размера
+/// держится здесь и в потоковой проверке внутри хендлера upload().
+///
+/// Схема работы (без перечитывания тела и без ложных срабатываний):
+///  - если клиент объявил `Content-Length` больше лимита — сразу отвечаем
+///    «413» с понятным сообщением, не читая тело;
+///  - иначе тело передаётся дальше как есть, а реальный порог по фактическим
+///    байтам обеспечивает потоковая проверка в `upload()`;
+///  - если во время разбора multipart поток оборвался ошибкой (например,
+///    клиент закрыл соединение), гипер-соединение корректно завершается,
+///    а не «зависает» без ответа.
 async fn body_limit(
     State(state): State<AppState>,
-    req: axum::extract::Request,
+    req: Request,
     next: middleware::Next,
 ) -> Response {
     let limit = state.config().max_upload_bytes();
+    // Запас на служебные части multipart (границы, заголовки частей) и на то,
+    // что файл может быть ровно `limit` байт.
     let cap = limit + limit / 8 + 1024 * 1024;
-    let (parts, body) = req.into_parts();
-    let limited = axum::body::Body::new(LimitedBody::new(body, cap));
-    next.run(axum::extract::Request::from_parts(parts, limited)).await
+
+    // Быстрая проверка по заявленной длине (если она известна).
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(len) = declared {
+        if len > cap as u64 {
+            return too_large_response(limit);
+        }
+    }
+
+    let resp = next.run(req).await;
+    drain_unfinished_request(resp, declared.is_some())
+}
+
+/// Ответ «запрос слишком большой» с человекочитаемым текстом (его покажет
+/// страница загрузки при ajax-ошибке вместо бессмысленного «Ошибка загрузки»).
+fn too_large_response(limit: usize) -> Response {
+    let label = templates::human_size(limit as u64);
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "Файл слишком большой: превышен лимит {label}. \
+             Администратор может увеличить его в /admin."
+        ),
+    )
+        .into_response()
+}
+
+/// Если хендлер вернул ошибку 400 (например, multipart-экстрактор отказал,
+/// не начав читать тело), а клиент объявил `Content-Length`, hyper не может
+/// корректно завершить соединение с незавершённым телом: браузер не получает
+/// ответ, и на странице «ничего не происходит». В этом случае возвращаем
+/// ответ с заголовком `Connection: close` — гипер допишет ответ и корректно
+/// закроет соединение, xhr увидит сетевую ошибку и покажет понятное сообщение.
+fn drain_unfinished_request(resp: Response, req_had_known_length: bool) -> Response {
+    if !(req_had_known_length && resp.status() == StatusCode::BAD_REQUEST) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    parts.headers.insert(
+        header::CONNECTION,
+        HeaderValue::from_static("close"),
+    );
+    axum::response::Response::from_parts(parts, body).into_response()
 }
