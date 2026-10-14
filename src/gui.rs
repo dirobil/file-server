@@ -5,6 +5,9 @@
 //! (`http://<ip>:<порт>`): камеру телефона наводят на QR — и открывают страницу
 //! загрузки файлов. Рядом — кнопка «Открыть в браузере».
 //!
+//! Если в конфиге задана директория хранилища, в окне появляется блок с её
+//! путём и кнопкой «📂 Открыть папку» (проводник Windows / Finder / xdg-open).
+//!
 //! Сервер поднимается внутри окна на фоновой tokio-задаче; как только сокет
 //! привязан, порт узнаётся через `listener.local_addr()` — поэтому можно
 //! стартовать с портом 0 («любой свободный»).
@@ -131,6 +134,9 @@ struct GuiApp {
     server: Option<ServerInfo>,
     qr_texture: Option<egui::TextureHandle>,
     error: Option<String>,
+    /// Сообщение об ошибке последнего действия (открытие папки и т.п.) —
+    /// показывается один кадр рядом с соответствующей кнопкой.
+    action_error: Option<String>,
 }
 
 impl GuiApp {
@@ -142,6 +148,7 @@ impl GuiApp {
             server: None,
             qr_texture: None,
             error: None,
+            action_error: None,
         };
         app.start_server();
         app
@@ -228,6 +235,67 @@ impl GuiApp {
             rgba.extend_from_slice(&[v, v, v, 255]);
         }
         Some((rgba, [w as usize, h as usize]))
+    }
+
+    /// Блок «Папка хранилища»: если в конфиге задана директория — показываем
+    /// её путь и кнопку открытия в проводнике ОС. Если не задана — подсказку,
+    /// где её настроить (страница /admin).
+    fn storage_section(&mut self, ui: &mut egui::Ui) {
+        let dir = self.state.storage_dir();
+        match dir {
+            Some(dir) => {
+                let exists = dir.is_dir();
+                let path_text = dir.display().to_string();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Хранилище:").strong());
+                    let text = if exists {
+                        path_text.clone()
+                    } else {
+                        format!("{path_text} (папка не найдена)")
+                    };
+                    // Длинные пути троем многоточием, чтобы умещались в окно.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .monospace()
+                                .color(if exists {
+                                    egui::Color32::from_rgb(40, 100, 210)
+                                } else {
+                                    egui::Color32::from_rgb(200, 120, 40)
+                                }),
+                        )
+                        .truncate(),
+                    );
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let btn = ui.add_enabled(exists, egui::Button::new("📂 Открыть папку"));
+                    if btn.clicked() {
+                        // Успех — очищаем предыдущую ошибку; неудача — запоминаем текст.
+                        self.action_error = open_path(&dir);
+                    } else {
+                        // В кадрах без нажатия ошибка не показывается повторно.
+                        self.action_error = None;
+                    }
+                    if ui.small_button("📋 скопировать путь").clicked() {
+                        ui.ctx().copy_text(path_text.clone());
+                    }
+                });
+                // Ошибку открытия показываем ровно один кадр после нажатия.
+                if let Some(err) = self.action_error.take() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("⚠ {err}"));
+                }
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(
+                        "Папка хранилища не настроена — задайте её в админ-панели (/admin)",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        }
     }
 }
 
@@ -317,6 +385,12 @@ impl eframe::App for GuiApp {
                     .weak(),
                 );
             });
+            ui.add_space(6.0);
+
+            // --- Папка хранилища (если настроена через конфиг/админку) ---
+            // Читаем состояние каждый кадр: админ может сменить директорию
+            // через веб-интерфейс, не перезапуская GUI.
+            self.storage_section(ui);
         });
     }
 
@@ -335,5 +409,14 @@ fn local_ip() -> Option<IpAddr> {
 fn open_in_browser(url: &str) {
     if let Err(e) = open::that(url) {
         eprintln!("Не удалось открыть браузер: {e}");
+    }
+}
+
+/// Открыть папку в проводнике ОС (Windows: explorer, macOS: Finder, Linux: xdg-open).
+/// Возвращает `Some(описание)` при неудаче — чтобы показать ошибку прямо в окне.
+fn open_path(path: &std::path::Path) -> Option<String> {
+    match open::that(path) {
+        Ok(()) => None,
+        Err(e) => Some(format!("не удалось открыть {}: {e}", path.display())),
     }
 }
