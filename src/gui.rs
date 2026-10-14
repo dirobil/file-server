@@ -271,15 +271,18 @@ impl GuiApp {
                 ui.horizontal(|ui| {
                     let btn = ui.add_enabled(exists, egui::Button::new("📂 Открыть папку"));
                     if btn.clicked() {
+                        // Успех — очищаем предыдущую ошибку; неудача — запоминаем текст.
                         self.action_error = open_path(&dir);
+                    } else {
+                        // В кадрах без нажатия ошибка не показывается повторно.
+                        self.action_error = None;
                     }
                     if ui.small_button("📋 скопировать путь").clicked() {
                         ui.ctx().copy_text(path_text.clone());
                     }
                 });
-                // Ошибку открытия показываем отдельной строкой (в тот же кадр,
-                // когда кнопка только что нажалась и action_error заполнен).
-                if let Some(err) = &self.action_error {
+                // Ошибку открытия показываем ровно один кадр после нажатия.
+                if let Some(err) = self.action_error.take() {
                     ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("⚠ {err}"));
                 }
             }
@@ -298,8 +301,6 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Ошибки последнего действия показываем один кадр, затем очищаем.
-        let _ = self.action_error.take();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(12.0);
             ui.heading("📁 Файловый сервер");
