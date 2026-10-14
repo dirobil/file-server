@@ -137,6 +137,9 @@ struct GuiApp {
     /// Сообщение об ошибке последнего действия (открытие папки и т.п.) —
     /// показывается один кадр рядом с соответствующей кнопкой.
     action_error: Option<String>,
+    /// Ошибка/подсказка после нажатия «Выбрать папку…» — её нельзя показать
+    /// в том же кадре (диалог блокирует UI), поэтому храним до следующего кадра.
+    pending_pick_error: Option<String>,
 }
 
 impl GuiApp {
@@ -149,6 +152,7 @@ impl GuiApp {
             qr_texture: None,
             error: None,
             action_error: None,
+            pending_pick_error: None,
         };
         app.start_server();
         app
@@ -238,8 +242,8 @@ impl GuiApp {
     }
 
     /// Блок «Папка хранилища»: если в конфиге задана директория — показываем
-    /// её путь и кнопку открытия в проводнике ОС. Если не задана — подсказку,
-    /// где её настроить (страница /admin).
+    /// её путь и кнопку открытия в проводнике ОС. Если не задана — кнопка
+    /// выбора папки (диалог + сохранение в конфиг, как делает /admin).
     fn storage_section(&mut self, ui: &mut egui::Ui) {
         let dir = self.state.storage_dir();
         match dir {
@@ -253,7 +257,7 @@ impl GuiApp {
                     } else {
                         format!("{path_text} (папка не найдена)")
                     };
-                    // Длинные пути троем многоточием, чтобы умещались в окно.
+                    // Длинные пути обрезаем многоточием, чтобы умещались в окно.
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(text)
@@ -270,12 +274,11 @@ impl GuiApp {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     let btn = ui.add_enabled(exists, egui::Button::new("📂 Открыть папку"));
+                    // Ошибка показывается ровно один кадр после нажатия:
+                    // success очищает предыдущую, кадры без клика — тоже.
+                    let mut err = None;
                     if btn.clicked() {
-                        // Успех — очищаем предыдущую ошибку; неудача — запоминаем текст.
-                        self.action_error = open_path(&dir);
-                    } else {
-                        // В кадрах без нажатия ошибка не показывается повторно.
-                        self.action_error = None;
+                        err = open_path(&dir);
                     }
                     if ui.small_button("📋 скопировать путь").clicked() {
                         ui.ctx().copy_text(path_text.clone());
@@ -294,8 +297,44 @@ impl GuiApp {
                     .small()
                     .weak(),
                 );
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui.button("📂 Выбрать папку…").clicked() {
+                        self.pick_storage_dir();
+                    }
+                    let err = self.pending_pick_error.take();
+                    self.show_action_error(ui, err);
+                });
             }
         }
+    }
+
+    /// Показать сообщение об ошибке действия (ровно один кадр).
+    fn show_action_error(&mut self, ui: &mut egui::Ui, err: Option<String>) {
+        self.action_error = err;
+        if let Some(err) = self.action_error.take() {
+            ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("⚠ {err}"));
+        }
+    }
+
+    /// Диалог выбора папки хранилища (нативный, через `rfd`). Выбор сохраняем
+    /// в то же состояние и конфиг-файл, что обновляет и веб-админка
+    /// (`AppState::set_storage_dir`), — сервер сразу начнёт писать туда.
+    #[cfg(feature = "gui-folder-picker")]
+    fn pick_storage_dir(&mut self) {
+        let Some(path) = rfd::FileDialog::new().set_title("Папка для обмена файлами").pick_folder()
+        else {
+            return; // пользователь отменил
+        };
+        self.pending_pick_error = self.state.set_storage_dir(Some(path)).err();
+    }
+
+    /// Без фичи `gui-folder-picker` диалога нет — подсказываем про /admin.
+    #[cfg(not(feature = "gui-folder-picker"))]
+    fn pick_storage_dir(&mut self) {
+        self.pending_pick_error = Some(
+            "выбор папки через GUI недоступен в этой сборке — задайте её в /admin".to_string(),
+        );
     }
 }
 
