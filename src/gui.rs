@@ -114,8 +114,8 @@ fn native_options() -> eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // Высота с запасом: QR + адрес + кнопки + блок «Хранилище»,
             // чтобы нижняя кнопка не уходила за край окна.
-            .with_inner_size([440.0, 680.0])
-            .with_min_inner_size([360.0, 520.0])
+            .with_inner_size([440.0, 400.0])
+            .with_min_inner_size([360.0, 400.0])
             .with_title("Файловый сервер"),
         ..Default::default()
     }
@@ -412,12 +412,12 @@ impl eframe::App for GuiApp {
             // Размер считаем от ширины окна и резервируем место заранее
             // (`allocate_space`): так нижние кнопки и блок «Хранилище» гарантированно
             // остаются в видимой области и не уезжают за край при маленьком окне.
-            const QR_RESERVED_BOTTOM: f32 = 190.0; // кнопки + блок хранилища
+            const QR_RESERVED_BOTTOM: f32 = 120.0; // кнопки + блок хранилища
             let size = (ui.available_width() - 16.0)
-                .min(ui.max_rect().height() - QR_RESERVED_BOTTOM)
+                .min(ui.available_height() - QR_RESERVED_BOTTOM)
                 .clamp(140.0, 360.0);
 
-            ui.allocate_space(egui::vec2(ui.available_width(), size));
+            //ui.allocate_space(egui::vec2(ui.available_width(), size));
             let qr_rect = {
                 let cursor = ui.cursor();
                 egui::Rect::from_center_size(
