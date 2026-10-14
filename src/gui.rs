@@ -112,8 +112,10 @@ fn split_bind(bind: &str) -> (String, u16) {
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([440.0, 560.0])
-            .with_min_inner_size([360.0, 420.0])
+            // Высота с запасом: QR + адрес + кнопки + блок «Хранилище»,
+            // чтобы нижняя кнопка не уходила за край окна.
+            .with_inner_size([440.0, 680.0])
+            .with_min_inner_size([360.0, 520.0])
             .with_title("Файловый сервер"),
         ..Default::default()
     }
@@ -246,6 +248,9 @@ impl GuiApp {
     /// выбора папки (диалог + сохранение в конфиг, как делает /admin).
     fn storage_section(&mut self, ui: &mut egui::Ui) {
         let dir = self.state.storage_dir();
+        // Сообщение об ошибке последнего действия показываем ровно один кадр:
+        // забираем его до match'а, чтобы ветки не сбрасывали друг друга.
+        let action_err = self.action_error.take();
         match dir {
             Some(dir) => {
                 let exists = dir.is_dir();
@@ -276,9 +281,8 @@ impl GuiApp {
                     let btn = ui.add_enabled(exists, egui::Button::new("📂 Открыть папку"));
                     // Ошибка показывается ровно один кадр после нажатия:
                     // success очищает предыдущую, кадры без клика — тоже.
-                    let mut err = None;
                     if btn.clicked() {
-                        err = open_path(&dir);
+                        self.action_error = open_path(&dir);
                     }
                     if ui.small_button("📋 скопировать путь").clicked() {
                         ui.ctx().copy_text(path_text.clone());
@@ -302,10 +306,21 @@ impl GuiApp {
                     if ui.button("📂 Выбрать папку…").clicked() {
                         self.pick_storage_dir();
                     }
-                    let err = self.pending_pick_error.take();
-                    self.show_action_error(ui, err);
+                    // Диалог блокирует UI, поэтому ошибку выбора показываем
+                    // на следующем кадре (берём из pending_pick_error).
+                    if self.pending_pick_error.is_some() {
+                        ui.label("");
+                    }
                 });
+
+                if let Some(err) = self.pending_pick_error.take() {
+                    self.action_error = Some(err);
+                }
             }
+
+        }
+        if let Some(err) = action_err {
+            ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("⚠ {err}"));
         }
     }
 
@@ -394,19 +409,32 @@ impl eframe::App for GuiApp {
             }
 
             // --- QR-код рядом с адресом ---
+            // Размер считаем от ширины окна и резервируем место заранее
+            // (`allocate_space`): так нижние кнопки и блок «Хранилище» гарантированно
+            // остаются в видимой области и не уезжают за край при маленьком окне.
+            const QR_RESERVED_BOTTOM: f32 = 190.0; // кнопки + блок хранилища
             let size = (ui.available_width() - 16.0)
-                .min(ui.available_height() - 120.0)
+                .min(ui.max_rect().height() - QR_RESERVED_BOTTOM)
                 .clamp(140.0, 360.0);
-            ui.centered_and_justified(|ui| {
-                let resp = ui.add(
-                    egui::Image::new(self.qr_texture.as_ref().unwrap())
-                        .fit_to_exact_size(egui::vec2(size, size))
-                        .sense(egui::Sense::click()),
-                );
-                if resp.clicked() {
-                    open_in_browser(&url);
-                }
-            });
+
+            ui.allocate_space(egui::vec2(ui.available_width(), size));
+            let qr_rect = {
+                let cursor = ui.cursor();
+                egui::Rect::from_center_size(
+                    egui::pos2(cursor.center().x, cursor.top() + size / 2.0),
+                    egui::vec2(size, size),
+                )
+            };
+            let resp = ui.put(
+                qr_rect,
+                egui::Image::new(self.qr_texture.as_ref().unwrap())
+                    .fit_to_exact_size(egui::vec2(size, size))
+                    .sense(egui::Sense::click()),
+            );
+            if resp.clicked() {
+                open_in_browser(&url);
+            }
+
             ui.add_space(6.0);
 
             ui.separator();
