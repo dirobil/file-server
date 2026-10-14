@@ -32,8 +32,13 @@ async function upload(files){
  prog.style.display='block';prog.value=0;
  const xhr=new XMLHttpRequest();xhr.open('POST','/upload');
  xhr.upload.onprogress=e=>{if(e.lengthComputable)prog.value=e.loaded/e.total*100};
- xhr.onload=()=>location.reload();
- xhr.onerror=()=>alert('Ошибка загрузки');
+ xhr.onload=()=>{
+  if(xhr.status>=200&&xhr.status<300){location.reload();return;}
+  prog.style.display='none';
+  alert('Загрузка не удалась ('+xhr.status+'): '+(xhr.responseText||'неизвестная ошибка сервера'));
+ };
+ xhr.onerror=()=>{prog.style.display='none';alert('Соединение с сервером оборвалось — загрузка не завершена. Проверьте, что сервер запущен, и попробуйте ещё раз.');};
+ xhr.ontimeout=()=>{prog.style.display='none';alert('Превышено время ожидания загрузки.');};
  xhr.send(fd);
 }
 function delFile(url){fetch('/delete/'+url,{method:'POST'}).then(()=>location.reload())}
