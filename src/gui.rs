@@ -283,13 +283,16 @@ impl GuiApp {
                     if ui.small_button("📋 скопировать путь").clicked() {
                         ui.ctx().copy_text(path_text.clone());
                     }
-                    self.show_action_error(ui, err);
                 });
+                // Ошибку открытия показываем ровно один кадр после нажатия.
+                if let Some(err) = self.action_error.take() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("⚠ {err}"));
+                }
             }
             None => {
                 ui.label(
                     egui::RichText::new(
-                        "Папка хранилища не настроена — выберите её, или задайте в /admin",
+                        "Папка хранилища не настроена — задайте её в админ-панели (/admin)",
                     )
                     .small()
                     .weak(),

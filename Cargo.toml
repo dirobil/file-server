@@ -23,13 +23,5 @@ eframe = "0.31"                 # immediate-mode GUI, рендер через gl
 qrcode = { version = "0.14", default-features = false, features = ["image"] }  # генерация QR-кода (растровый рендер)
 image = { version = "0.25", default-features = false }   # растр QR -> пиксели для egui
 local-ip-address = "0.6"        # определение локального IP в LAN
-open = "5"                      # открыть ссылку/папку в системном браузере/проводнике
+open = "5"                      # открыть ссылку в системном браузере
 http-body = "1"
-# Нативный диалог выбора папки для кнопки «Выбрать папку…» в GUI
-# (async-закрытия не нужны — используем синхронный API из GUI-потока).
-rfd = { version = "0.15", optional = true }
-
-[features]
-default = ["gui-folder-picker"]
-# Кнопка выбора папки хранилища через нативный диалог ОС (крейт rfd).
-gui-folder-picker = ["dep:rfd"]
